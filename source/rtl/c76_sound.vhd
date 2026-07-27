@@ -57,9 +57,14 @@ entity c76_sound is
       in_player2 : in  std_logic_vector(7 downto 0);
       in_player4 : in  std_logic_vector(7 downto 0);
       in_switch  : in  std_logic_vector(7 downto 0);
-      in_adc0    : in  std_logic_vector(7 downto 0) := x"FF";  -- AN0: Pocket Racer steering wheel
-      in_adc1    : in  std_logic_vector(7 downto 0) := x"FF";  -- P1 BTN4 analog (Tekken right kick)
-      in_adc2    : in  std_logic_vector(7 downto 0) := x"FF";  -- P1 BTN3 analog (Tekken left kick)
+      in_adc0    : in  std_logic_vector(7 downto 0) := x"FF";  -- AN0: Pocket Racer wheel / P3 BTN3
+      in_adc1    : in  std_logic_vector(7 downto 0) := x"FF";  -- P1 BTN4 (Tekken right kick) / P3 BTN2
+      in_adc2    : in  std_logic_vector(7 downto 0) := x"FF";  -- P1 BTN3 (Tekken left kick)  / P3 BTN1
+      in_adc3    : in  std_logic_vector(7 downto 0) := x"FF";  -- P3 RIGHT  (base namcos11 layout)
+      in_adc4    : in  std_logic_vector(7 downto 0) := x"FF";  -- P3 LEFT
+      in_adc5    : in  std_logic_vector(7 downto 0) := x"FF";  -- P3 DOWN
+      in_adc6    : in  std_logic_vector(7 downto 0) := x"FF";  -- P3 UP
+      in_adc7    : in  std_logic_vector(7 downto 0) := x"FF";  -- START3
 
       -- SPROG sound-program ROM (per game, in SDRAM)
       sprog_addr : out std_logic_vector(19 downto 0);
@@ -90,6 +95,8 @@ entity c76_sound is
       -- C76 liveness/crash diagnostics (for the System 11 triage overlay)
       dbg_halted    : out std_logic := '0';                       -- C76 hit an unimplemented opcode (ST_HALT)
       dbg_c352_seen : out std_logic := '0';                       -- C76 ever wrote the C352 (= BIOS init ran = alive)
+      dbg_ad_state  : out std_logic_vector(15 downto 0) := (others=>'0'); -- DIAG pocketrc A-D: [15]ADCON-start [14:8]ad_tick_cnt [7:0]AN0
+
       dbg_pc_out    : out std_logic_vector(23 downto 0) := (others => '0'); -- live C76 program counter
       -- Earliest-behavior diagnostics: did the C76 even start its BIOS on silicon?
       dbg_first_pc     : out std_logic_vector(23 downto 0) := (others => '0'); -- FIRST retired PC after reset (=reset vector if OK)
@@ -104,7 +111,25 @@ entity c76_sound is
       -- MAME value 0x0080) and did it WRITE the boot ACK (0xBD36, MAME value 0x0536)?
       -- [31]=wrote-BD36-ever [30]=read-BD34-ever [23:16]=last byte written to BD36
       -- [15:8]=last byte READ from BD35 [7:0]=last byte READ from BD34
-      dbg_mb_hs        : out std_logic_vector(31 downto 0) := (others=>'0')
+      dbg_mb_hs        : out std_logic_vector(31 downto 0) := (others=>'0');
+      -- DIAG dpram readback: drive dbg_rb_addr (14-bit WORD index into 0x4000-word shared RAM) with
+      -- dbg_rb_en='1' to steal the MIPS-side port B for one JTAG read; dbg_rb_q returns dpram[addr].
+      dbg_rb_en        : in  std_logic := '0';
+      dbg_rb_addr      : in  std_logic_vector(13 downto 0) := (others=>'0');
+      dbg_rb_q         : out std_logic_vector(15 downto 0) := (others=>'0');
+      -- DIAG coin->C352 correlation: [15:8]=coin edges seen (in_switch bit5 falling), [7:0]=MAX C352
+      -- key-ons in the ~0.5s window after any coin edge. Insert coins at the SILENT coin screen: a
+      -- nonzero low byte => the coin DOES key on a C352 voice (issue is downstream volume/fetch);
+      -- 0 with a nonzero high byte => coins seen but NO key-on triggered (command dropped/never-sent).
+      dbg_coin         : out std_logic_vector(15 downto 0) := (others=>'0');
+      -- DIAG coin capture: MIPS-command ring (mode 6) + C76-response latches (mode 4), both armed on
+      -- a SILENT coin. Ring = up to 32 distinct MIPS writes to mailbox region 0xBD00-0xBFFF = the coin
+      -- command. Read ring[idx] via dbg_ring_idx(4:0): [31]=valid [25:16]=byte-off from 0xBD00 [15:0]=data.
+      dbg_ring_idx     : in  std_logic_vector(4 downto 0) := (others=>'0');
+      dbg_ring_q       : out std_logic_vector(31 downto 0) := (others=>'0');
+      -- C76 response to the coin (mode 4): [31]bda4_seen [30]bd01_clr [29]bd00_seen [23:16]bda4_val
+      --   [15:8]#C76-writes-to-BDxx [7:0]bd00_val. bda4_seen/bd01_clr => C76 processed the command.
+      dbg_c76resp      : out std_logic_vector(31 downto 0) := (others=>'0')
    );
 end entity;
 
@@ -125,6 +150,8 @@ architecture arch of c76_sound is
    -- block-RAM primitive (C76 byte side = port A, MIPS byte side = port B).
    signal sh_rdata_c76 : std_logic_vector(7 downto 0);
    signal c76_idx : unsigned(14 downto 0);   -- ext_addr - 0x4000, 0..0x7FFF
+   signal addr_b_mux : std_logic_vector(13 downto 0);  -- MIPS port B addr, muxed for JTAG readback
+   signal mips_wr_gated : std_logic;                   -- MIPS write, suppressed during JTAG readback
    signal sh_wren  : std_logic;
 
    -- C352 register write strobe + read data
@@ -134,6 +161,37 @@ architecture arch of c76_sound is
    signal dbg_vwr_r        : std_logic_vector(31 downto 0) := (others => '0');
    signal dbg_keyon_r      : std_logic_vector(7 downto 0) := (others => '0');
    signal dbg_commit_r     : std_logic_vector(5 downto 0) := (others => '0');
+   -- DIAG coin->keyon correlation (gated on C352 silence)
+   signal busy_cnt_i       : std_logic_vector(5 downto 0);
+   signal in_sw5_prev      : std_logic := '1';
+   signal coin_win         : unsigned(24 downto 0) := (others => '0');
+   signal keyon_at_coin    : unsigned(7 downto 0) := (others => '0');
+   signal coin_keyon_dmax  : unsigned(7 downto 0) := (others => '0');
+   signal coin_count       : unsigned(7 downto 0) := (others => '0');   -- trigger count (coin or kick)
+   -- kick-gated capture (Tekken SFX diag): trigger the SAME ring/latches on a P1 KICK edge
+   -- (in_adc1=0x00 right kick joy[7], in_adc2=0x00 left kick joy[6]) so the mode-6 ring captures
+   -- the kick's mailbox sound-command. No silence gate (music plays during a match).
+   signal kick_now         : std_logic;
+   signal kick_prev        : std_logic := '0';
+   signal trig_kick        : std_logic := '0';   -- last trigger was a kick (not a coin)
+   -- MIPS-command ring (armed for the silent-coin window): 32 distinct MIPS writes to the mailbox
+   -- region 0xBD00-0xBFFF = the coin command. addr stored as 10-bit byte-offset from 0xBD00.
+   -- (MIPS-only so the C76's continuous BD00 polling can't crowd out the command; the C76 RESPONSE
+   --  is captured separately in the coin-gated latches below -> mode 4.)
+   type ring10_t is array(0 to 31) of std_logic_vector(9 downto 0);
+   type ring16_t is array(0 to 31) of std_logic_vector(15 downto 0);
+   signal ring_addr  : ring10_t := (others => (others=>'0'));
+   signal ring_data  : ring16_t := (others => (others=>'0'));
+   signal ring_valid : std_logic_vector(31 downto 0) := (others=>'0');
+   signal ring_widx  : unsigned(5 downto 0) := (others=>'0');
+   signal mips_wr_p  : std_logic := '0';   -- MIPS write-strobe edge (distinct writes only)
+   -- C76-response latches, coin-gated (reset each silent coin): did the C76 answer the command?
+   signal c76r_bda4_seen : std_logic := '0';                       -- C76 wrote 0xBDA4 (voice mask)
+   signal c76r_bda4_val  : std_logic_vector(7 downto 0) := (others=>'0');  -- last BDA4 value
+   signal c76r_bd01_clr  : std_logic := '0';                       -- C76 wrote 0xBD01 = 0 (consumed pending)
+   signal c76r_bd00_seen : std_logic := '0';                       -- C76 wrote 0xBD00 (ack/status)
+   signal c76r_bd00_val  : std_logic_vector(7 downto 0) := (others=>'0');  -- last BD00 value
+   signal c76r_wrcnt     : unsigned(7 downto 0) := (others=>'0');   -- # C76 writes to BDxx region in window
 
    -- IRQ generation
    signal irq0, irq2 : std_logic := '0';
@@ -179,9 +237,11 @@ begin
          bios_wr => bios_wr, bios_addr => bios_addr, bios_din => bios_din,
          irq0 => irq0, irq1 => '0', irq2 => irq2,
          in_adc0 => in_adc0, in_adc1 => in_adc1, in_adc2 => in_adc2,
+         in_adc3 => in_adc3, in_adc4 => in_adc4, in_adc5 => in_adc5,
+         in_adc6 => in_adc6, in_adc7 => in_adc7,
          ext_addr => ext_addr, ext_dout => ext_dout, ext_din => ext_din,
          ext_rd => ext_rd, ext_wr => ext_wr, ext_ready => ext_ready,
-         dbg_pc => dbg_pc_i, dbg_opcode => dbg_op_i, dbg_valid => dbg_valid_i, dbg_halted => dbg_halted, dbg_x => open,
+         dbg_pc => dbg_pc_i, dbg_opcode => dbg_op_i, dbg_valid => dbg_valid_i, dbg_halted => dbg_halted, dbg_x => dbg_ad_state,
          dbg_ram80 => dbg_ram80, dbg_ram83 => dbg_ram83
       );
    -- When the C76 has derailed to 0xC000, report the JUMPER {opcode,PC} that sent it there;
@@ -296,14 +356,17 @@ begin
                dbg_mb_hs(30)          <= '1';
                dbg_mb_hs(7 downto 0)  <= ext_din;
             end if;
-            if (ext_rd = '1' and ext_ready = '1' and sel_shared = '1' and unsigned(ext_addr) = x"00BD35") then
-               dbg_mb_hs(15 downto 8) <= ext_din;
-            end if;
             -- C76 sound heartbeat: latch writes to 0xBDA4 (cycles ~2ms in MAME during the movie)
             if (ext_wr = '1' and sel_shared = '1' and unsigned(ext_addr) = x"00BDA4") then
                dbg_mb_hs(29)           <= '1';        -- heartbeat-ever
                dbg_mb_hs(28 downto 24) <= ext_dout(7 downto 3);  -- rolling value bits (watch for change)
             end if;
+         end if;
+         -- MIPS-side capture (clk-rate, NOT ce-gated): does the MIPS actually deliver command
+         -- 0x90 to shared-RAM word 0x3E9A (= byte 0x1FA0BD34)? Distinguishes a MIPS/dpram-write
+         -- miss from a C76-ISR-condition miss. Repurposes bits15:8 (old BD35 field).
+         if (mips_wr = '1' and unsigned(mips_addr) = 16#3E9A#) then
+            dbg_mb_hs(15 downto 8) <= mips_din(7 downto 0);  -- last MIPS-written 0xBD34 low byte
          end if;
       end if;
    end process;
@@ -321,9 +384,13 @@ begin
       port map (
          clock_a   => clk, address_a => std_logic_vector(c76_idx), data_a => ext_dout,
          wren_a    => sh_wren, q_a => sh_rdata_c76,
-         clock_b   => clk, address_b => mips_addr, data_b => mips_din,
-         wren_b    => mips_wr, q_b => mips_dout
+         clock_b   => clk, address_b => addr_b_mux, data_b => mips_din,
+         wren_b    => mips_wr_gated, q_b => mips_dout
       );
+   -- steal port B for a JTAG readback when dbg_rb_en=1 (MIPS is stuck polling, so this is safe)
+   addr_b_mux    <= dbg_rb_addr when dbg_rb_en = '1' else mips_addr;
+   mips_wr_gated <= mips_wr and (not dbg_rb_en);
+   dbg_rb_q      <= mips_dout;
 
 -- synthesis translate_off
    c352rd_trace : process(clk)
@@ -367,6 +434,85 @@ begin
       end if;
    end process;
    dbg_c352_wrcnt <= dbg_c352_wrcnt_r;
+
+   -- DIAG coin->C352-keyon correlation: on a coin edge (in_switch bit5 = COIN1, active-low, 1->0),
+   -- snapshot the C352 key-on count and, over the following ~0.5s window, latch the MAX key-ons seen
+   -- since that coin. At the SILENT coin screen this isolates whether a coin keys on a C352 voice.
+   process(clk)
+   begin
+      if rising_edge(clk) then
+         if reset = '1' then
+            in_sw5_prev <= '1'; coin_win <= (others=>'0');
+            coin_keyon_dmax <= (others=>'0'); coin_count <= (others=>'0');
+            ring_valid <= (others=>'0'); ring_widx <= (others=>'0'); mips_wr_p <= '0';
+            c76r_bda4_seen <= '0'; c76r_bda4_val <= (others=>'0'); c76r_bd01_clr <= '0';
+            c76r_bd00_seen <= '0'; c76r_bd00_val <= (others=>'0'); c76r_wrcnt <= (others=>'0');
+            kick_prev <= '0'; trig_kick <= '0';
+         else
+            in_sw5_prev <= in_switch(5);
+            kick_prev   <= kick_now;
+            mips_wr_p   <= mips_wr;     -- for rising-edge detect (capture distinct writes only)
+            -- Trigger the capture on a P1 KICK edge (music playing, no silence gate) OR a SILENT coin.
+            -- The user does isolated kicks -> the mode-6 ring captures the kick's mailbox command.
+            if (kick_now = '1' and kick_prev = '0')
+               or (in_switch(5) = '0' and in_sw5_prev = '1' and unsigned(busy_cnt_i) = 0) then
+               if coin_count /= x"FF" then coin_count <= coin_count + 1; end if;
+               trig_kick <= kick_now;                                     -- 1 = this trigger was a kick
+               keyon_at_coin <= unsigned(dbg_keyon_r);
+               coin_win <= (others=>'1');                                 -- ~0.5s window @ clk
+               ring_valid <= (others=>'0'); ring_widx <= (others=>'0');   -- fresh MIPS-command capture
+               c76r_bda4_seen <= '0'; c76r_bd01_clr <= '0'; c76r_bd00_seen <= '0'; c76r_wrcnt <= (others=>'0');
+            elsif coin_win /= 0 then
+               coin_win <= coin_win - 1;
+               if (unsigned(dbg_keyon_r) - keyon_at_coin) > coin_keyon_dmax then
+                  coin_keyon_dmax <= unsigned(dbg_keyon_r) - keyon_at_coin;
+               end if;
+               -- MIPS command: record distinct MIPS writes to the mailbox region 0xBD00-0xBFFF (32 max),
+               -- EXCLUDING the generic periodic sound-handshake addresses (BD00=word 0x3E80, BE88=0x3F44,
+               -- BD24=0x3E92, BD28=0x3E94) which flood the ring every frame in-match. What remains = the
+               -- kick's distinct sound command (if it uses a different mailbox slot).
+               if mips_wr = '1' and mips_wr_p = '0' and unsigned(mips_addr) >= 16#3E80# and ring_widx < 32
+                  and unsigned(mips_addr) /= 16#3E80# and unsigned(mips_addr) /= 16#3F44#
+                  and unsigned(mips_addr) /= 16#3E92# and unsigned(mips_addr) /= 16#3E94# then
+                  -- MIPS word addr -> byte offset from 0xBD00 = 2*(word - 0x3E80)
+                  ring_addr(to_integer(ring_widx))  <= std_logic_vector(resize(unsigned(mips_addr) - 16#3E80#, 9) & '0');
+                  ring_data(to_integer(ring_widx))  <= mips_din;
+                  ring_valid(to_integer(ring_widx)) <= '1';
+                  ring_widx <= ring_widx + 1;
+               end if;
+               -- C76 RESPONSE latches: watch the C76's own writes (sh_wren, byte addr) to key regs
+               if sh_wren = '1' then
+                  if unsigned(ext_addr) >= x"00BD00" and unsigned(ext_addr) <= x"00BFFF" and c76r_wrcnt /= x"FF" then
+                     c76r_wrcnt <= c76r_wrcnt + 1;
+                  end if;
+                  if unsigned(ext_addr) = x"00BDA4" then
+                     c76r_bda4_seen <= '1'; c76r_bda4_val <= ext_dout;
+                  end if;
+                  if unsigned(ext_addr) = x"00BD01" and ext_dout = x"00" then
+                     c76r_bd01_clr <= '1';
+                  end if;
+                  if unsigned(ext_addr) = x"00BD00" then
+                     c76r_bd00_seen <= '1'; c76r_bd00_val <= ext_dout;
+                  end if;
+               end if;
+            end if;
+         end if;
+      end if;
+   end process;
+   dbg_busy_cnt <= busy_cnt_i;
+   -- P1 kick pressed = either analog kick input reads 0x00 (in_adc1=right kick joy[7], in_adc2=left kick joy[6])
+   kick_now <= '1' when (in_adc1 = x"00" or in_adc2 = x"00") else '0';
+   -- mode F: [15]=last-trigger-was-kick [14:8]=trigger count [7:0]=C352 keyon-delta-max in the window
+   dbg_coin <= trig_kick & std_logic_vector(coin_count(6 downto 0)) & std_logic_vector(coin_keyon_dmax);
+   -- MIPS-command ring readout: [31]=valid [25:16]=byte-off from 0xBD00 [15:0]=data
+   dbg_ring_q <= ring_valid(to_integer(unsigned(dbg_ring_idx)))
+                 & "00000"
+                 & ring_addr(to_integer(unsigned(dbg_ring_idx)))
+                 & ring_data(to_integer(unsigned(dbg_ring_idx)));
+   -- C76-response latches (mode 4): [31]bda4_seen [30]bd01_clr [29]bd00_seen [23:16]bda4_val
+   --   [15:8]c76-writes-to-BDxx-count [7:0]bd00_val. Answers: did the C76 respond to the coin?
+   dbg_c76resp <= c76r_bda4_seen & c76r_bd01_clr & c76r_bd00_seen & "00000"
+                  & c76r_bda4_val & std_logic_vector(c76r_wrcnt) & c76r_bd00_val;
    dbg_vwr        <= dbg_vwr_r;
    dbg_keyon_cnt  <= dbg_keyon_r;
    dbg_commit_cnt <= dbg_commit_r;
@@ -376,7 +522,7 @@ begin
          clk => clk, reset => reset, sample_ce => sample_ce,
          cs_addr => ext_addr(11 downto 0), cs_din => ext_dout,
          cs_wr => c352_cs_wr, cs_rdata => c352_rdata,
-         dbg_busy_cnt => dbg_busy_cnt,
+         dbg_busy_cnt => busy_cnt_i,
          rom_addr => wave_addr, rom_rd => wave_rd, rom_data => wave_data, rom_ready => wave_ready,
          audio_l => audio_l, audio_r => audio_r
       );

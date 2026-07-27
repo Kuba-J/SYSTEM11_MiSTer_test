@@ -306,6 +306,11 @@ entity psx_mister is
       zn_platform     : in  std_logic_vector(3 downto 0) := "0000";
       zn_system11     : in  std_logic := '0';  -- Namco System 11 mode
       keycus_id       : in  std_logic_vector(7 downto 0) := x"00";  -- System 11 KEYCUS type
+      -- System 11 GUN I/F (Point Blank 2 / Gunbarl, C443): absolute gun counters, pre-clamped
+      zn_gun1_x       : in  std_logic_vector(15 downto 0) := (others => '0');
+      zn_gun1_y       : in  std_logic_vector(15 downto 0) := (others => '0');
+      zn_gun2_x       : in  std_logic_vector(15 downto 0) := (others => '0');
+      zn_gun2_y       : in  std_logic_vector(15 downto 0) := (others => '0');
       -- EEPROM/nvram (MRA index 9) load + save -> psx_top -> zn1_io
       ee_dl_wr        : in  std_logic := '0';
       ee_dl_addr      : in  std_logic_vector(9 downto 0) := (others => '0');
@@ -326,7 +331,7 @@ entity psx_mister is
       zn_debug_val    : out std_logic_vector(31 downto 0) := (others => '0');  -- build #50
       zn_dbg_a0       : out std_logic_vector(31 downto 0) := (others => '0');
       zn_dbg_a1       : out std_logic_vector(31 downto 0) := (others => '0');
-      zn_dbg_eeprom_o : out std_logic_vector(23 downto 0) := (others => '0');
+      zn_dbg_eeprom_o : out std_logic_vector(31 downto 0) := x"BEEFDEAD";
       zn_dbg_gpu      : out std_logic_vector(31 downto 0) := (others => '0');
       zn_dbg_disp     : out std_logic_vector(31 downto 0) := (others => '0');
       zn_dbg_dma      : out std_logic_vector(31 downto 0) := (others => '0');
@@ -750,6 +755,10 @@ begin
       zn_platform     => zn_platform,
       zn_system11     => zn_system11,
       keycus_id       => keycus_id,
+      zn_gun1_x       => zn_gun1_x,
+      zn_gun1_y       => zn_gun1_y,
+      zn_gun2_x       => zn_gun2_x,
+      zn_gun2_y       => zn_gun2_y,
       ee_dl_wr        => ee_dl_wr,
       ee_dl_addr      => ee_dl_addr,
       ee_dl_data      => ee_dl_data,

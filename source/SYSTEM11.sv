@@ -375,6 +375,13 @@ parameter CONF_STR = {
 	"P2,DIP Switches;",
 	"P2O[96],DIP1 Test,Off,On;",
 	"P2O[97],DIP2 Freeze,Off,On;",
+	// Light-gun page (Point Blank 2 / Gunbarl, KEYCUS C443). Sensitivity is exposed rather than
+	// guessed: the gun counters span only 688 x 239 units, so a high-DPI mouse saturates them at
+	// 1:1. Crosshair defaults OFF — the real cabinet draws none (you aim a physical gun), and
+	// keycus 0x09 is shared with My Angel 3, which is not a gun game.
+	"P4,Light Gun;",
+	"P4O[100],Crosshair,Off,On;",
+	"P4O[99:98],Gun Sensitivity,1/4,1/8,1/2,1/1;",
 	"P3,Debug;",
 	"P3O[28],FPS Counter,Off,On;",
 	"P3O[93],Boot Debug Overlay,Off,On;",
@@ -1095,10 +1102,156 @@ wire        wave_ch3_own    = c76_wave_req | (wave_st == 2'd1);
 reg         c76_ever_sprog      = 1'b0;        // diag: C76 ever requested a SPROG read (=C76 running)
 reg         c76_sprog_done_ever = 1'b0;        // diag: a ch3 SPROG read ever completed
 
+// ===== System 11 GUN I/F aiming (Point Blank 2 / Gunbarl, KEYCUS C443) =====
+// The System 11 gun is NOT a scanline-sensing lightgun: the GUN I/F PCB just presents absolute
+// X/Y counters at 0x1F780000 (MAME namcos11.cpp lightgun_r). So aiming reduces to maintaining an
+// absolute position in the hardware's own counter units and clamping to MAME's legal spans:
+//   GUN1X 0x0D8..0x387 (centre 0x22F)      GUN1Y 0x02C..0x11B (centre 0x0A8)
+// PS/2 mice report RELATIVE deltas, so accumulate one step per mouse packet (mouse[24] toggles).
+// Note PS/2 +Y is UP while screen Y grows DOWN, hence the subtraction.
+// SENSITIVITY (2026-07-26): accumulating raw PS/2 deltas 1:1 pinned the pointer at the range
+// extremes on a high-DPI mouse (measured: gun_x stuck at 0x387 = MAX, gun_y at 0x02C = MIN).
+// Scale the deltas down, but keep 4 FRACTIONAL bits in the accumulator so slow, fine movements
+// still register instead of being truncated to zero. Divisor is OSD-selectable because it depends
+// on the user's mouse DPI, which we cannot know.
+// REDESIGN 2026-07-26 (crosshair was offset from the shots): the pointer is now canonical in a
+// RESOLUTION-INDEPENDENT virtual screen (1024 x 256), and BOTH the gun counters and the crosshair
+// are derived from it. Previously the pointer lived in gun-counter units and the crosshair assumed
+// those mapped 1:1 onto the active area — true only if the display were exactly 688x240, which it
+// is not, so the crosshair drifted away from the actual aim point.
+// Virtual width/height are powers of two, so every divide below is a constant SHIFT:
+//   gun_x = 216 + (px*687 >> 10)   gun_y = 44 + (py*239 >> 8)     (constant multiplies)
+//   screen  = (px*h_act >> 10),  (py*v_act >> 8)                  (one mult each, once per frame)
+// The crosshair therefore lands exactly where the gun points, by construction, at any resolution.
+localparam [13:0] PXMAX_F = 14'd1023 << 4;        // 10.4 fixed point
+localparam [11:0] PYMAX_F = 12'd255  << 4;        // 8.4 fixed point
+reg         [13:0] px_f       = 14'd512 << 4;     // centre
+reg         [11:0] py_f       = 12'd128 << 4;
+reg                mouse_ev_d = 1'b0;
+wire signed  [8:0] ms_dx      = {mouse[4], mouse[15:8]};
+wire signed  [8:0] ms_dy      = {mouse[5], mouse[23:16]};
+// OSD 0=1/4 (default) 1=1/8 2=1/2 3=1/1 -> left-shift of the 4-bit fraction
+wire         [2:0] gun_lsh    = (status[99:98] == 2'd0) ? 3'd2 :
+                                (status[99:98] == 2'd1) ? 3'd1 :
+                                (status[99:98] == 2'd2) ? 3'd3 : 3'd4;
+wire signed [15:0] dx_f       = $signed({{7{ms_dx[8]}}, ms_dx}) <<< gun_lsh;
+wire signed [15:0] dy_f       = $signed({{7{ms_dy[8]}}, ms_dy}) <<< gun_lsh;
+wire signed [16:0] nx_f       = $signed({3'b0, px_f}) + dx_f;
+wire signed [16:0] ny_f       = $signed({5'b0, py_f}) - dy_f;   // PS/2 +Y is UP, screen Y grows DOWN
+always @(posedge clk_1x) begin
+   mouse_ev_d <= mouse[24];
+   if (mouse_ev_d != mouse[24]) begin              // one update per mouse packet
+      px_f <= (nx_f < 0) ? 14'd0 : (nx_f > $signed({3'b0, PXMAX_F})) ? PXMAX_F : nx_f[13:0];
+      py_f <= (ny_f < 0) ? 12'd0 : (ny_f > $signed({5'b0, PYMAX_F})) ? PYMAX_F : ny_f[11:0];
+   end
+end
+wire  [9:0] gun_px = px_f[13:4];                   // 0..1023 virtual
+wire  [7:0] gun_py = py_f[11:4];                   // 0..255  virtual
+wire [19:0] gx_mul = gun_px * 10'd687;
+wire [15:0] gy_mul = gun_py * 8'd239;
+wire signed [15:0] gun_x = 16'sd216 + $signed({6'b0, gx_mul[19:10]});   // 216..903
+wire signed [15:0] gun_y = 16'sd44  + $signed({8'b0, gy_mul[15:8]});    // 44..283
+// Trigger: mouse LEFT acts as BUTTON1, which is exactly what MAME's ptblank2 PORT_MODIFY leaves
+// live on PLAYER1 (0x10). Button1 on a pad already works, so this only adds the mouse.
+wire gun_trigger = mouse[0];
+
+// ===== P2 light gun pointer (2026-07-26) =====
+// Point Blank 2 / Gunbarl are 2-PLAYER games: MAME defines GUN2X/GUN2Y with exactly the same
+// spans as GUN1 (X 0xd8..0x387, Y 0x2c..0x11b, centres 0x22f/0xa8) and keeps PLAYER2 bit 0x10
+// live as P2's trigger. Until now zn_gun2_x/y were tied to the P1 pointer, so both guns aimed at
+// the same spot and co-op was impossible.
+// WHY THE STICK AND NOT A SECOND MOUSE: hps_io exposes exactly ONE PS/2 stream (`ps2_mouse`) --
+// the HPS merges every physical mouse into it -- so a second mouse is not reachable from the
+// core. The P2 pad's left analog stick is the only independent pointing device available.
+// WHY VELOCITY AND NOT ABSOLUTE: a self-centring stick mapped straight to an absolute position
+// would snap the crosshair back to screen centre the moment you let go, which is useless for
+// aiming. Integrating deflection as a VELOCITY makes it behave like a trackball -- hold to glide,
+// release to hold position.
+// POLARITY: MiSTer analog axes follow the SDL/evdev convention, so stick UP is NEGATIVE Y. Screen
+// Y also grows downward, so P2 needs NO Y inversion (unlike the PS/2 mouse above, whose +Y is up).
+// Pointer lives in the SAME virtual 1024x256 space as P1, so it inherits the resolution-
+// independent crosshair mapping for free.
+wire signed [7:0] p2_sx_raw = joystick_analog_l1[7:0];
+wire signed [7:0] p2_sy_raw = joystick_analog_l1[15:8];
+// Deadzone: sticks rest a few counts off centre, and without this the crosshair would creep
+// across the screen forever while untouched.
+wire signed [7:0] p2_ax = (p2_sx_raw > 8'sd12 || p2_sx_raw < -8'sd12) ? p2_sx_raw : 8'sd0;
+wire signed [7:0] p2_ay = (p2_sy_raw > 8'sd12 || p2_sy_raw < -8'sd12) ? p2_sy_raw : 8'sd0;
+// DIGITAL D-PAD FALLBACK: on an arcade core P2 is very likely on a digital stick with no analog
+// axes at all, and without this they could not aim AT ALL. Synthesise a 3/4-deflection when a
+// direction is held and the analog stick is idle (analog always wins if it is deflected), which
+// is the same pattern used for the Pocket Racer steering ramp. joy2[3]=UP [2]=DOWN [1]=LEFT
+// [0]=RIGHT; screen Y grows down, so UP must be NEGATIVE.
+wire signed [7:0] p2_dpx = joy2[0] ? 8'sd96 : joy2[1] ? -8'sd96 : 8'sd0;
+wire signed [7:0] p2_dpy = joy2[2] ? 8'sd96 : joy2[3] ? -8'sd96 : 8'sd0;
+wire signed [7:0] p2_sx  = (p2_ax != 8'sd0) ? p2_ax : p2_dpx;
+wire signed [7:0] p2_sy  = (p2_ay != 8'sd0) ? p2_ay : p2_dpy;
+// Same OSD sensitivity control as the mouse, as a velocity divider. Default (1/4) crosses the
+// screen in ~1.0 s at full deflection; 1/1 in ~0.26 s.
+wire        [2:0] p2_rsh = (status[99:98] == 2'd0) ? 3'd3 :
+                           (status[99:98] == 2'd1) ? 3'd4 :
+                           (status[99:98] == 2'd2) ? 3'd2 : 3'd1;
+wire signed [15:0] p2_dx = $signed({{8{p2_sx[7]}}, p2_sx}) >>> p2_rsh;
+wire signed [15:0] p2_dy = $signed({{8{p2_sy[7]}}, p2_sy}) >>> p2_rsh;
+reg         [14:0] p2_tick_cnt  = 15'd0;         // 33.87 MHz / 32768 => ~1.03 kHz update
+reg         [13:0] p2x_f = 14'd512 << 4;         // 10.4 fixed point, centre
+reg         [11:0] p2y_f = 12'd128 << 4;         //  8.4 fixed point, centre
+reg                p2_gun_active = 1'b0;         // gates the P2 crosshair until P2 shows up
+wire signed [16:0] p2nx_f = $signed({3'b0, p2x_f}) + p2_dx;
+wire signed [16:0] p2ny_f = $signed({5'b0, p2y_f}) + p2_dy;
+always @(posedge clk_1x) begin
+   p2_tick_cnt <= p2_tick_cnt + 15'd1;
+   if (p2_tick_cnt == 15'd0) begin
+      p2x_f <= (p2nx_f < 0) ? 14'd0 : (p2nx_f > $signed({3'b0, PXMAX_F})) ? PXMAX_F : p2nx_f[13:0];
+      p2y_f <= (p2ny_f < 0) ? 12'd0 : (p2ny_f > $signed({5'b0, PYMAX_F})) ? PYMAX_F : p2ny_f[11:0];
+   end
+   // Latch "a second player is here" on first stick deflection or trigger pull, so a solo player
+   // never sees a stray second crosshair parked in the middle of the screen.
+   if ((p2_sx != 8'sd0) || (p2_sy != 8'sd0) || joy2[4]) p2_gun_active <= 1'b1;
+end
+// Titles that use MAME's BASE namcos11 port set, where ADC0/1/2 belong to PLAYER 3 (see the
+// in_adc1/in_adc2 comment at the c76_sound instance). Everything else PORT_MODIFYs those channels.
+wire zn_generic_adc = (zn_keycus_id == 8'h03)    // Dunk Mania
+                    | (zn_keycus_id == 8'h05)    // Xevious 3D-G
+                    | (zn_keycus_id == 8'h06)    // Dancing Eyes
+                    | (zn_keycus_id == 8'h08);   // Star Sweep
+
+wire  [9:0] gun2_px = p2x_f[13:4];                  // 0..1023 virtual
+wire  [7:0] gun2_py = p2y_f[11:4];                  // 0..255  virtual
+wire [19:0] g2x_mul = gun2_px * 10'd687;
+wire [15:0] g2y_mul = gun2_py * 8'd239;
+wire signed [15:0] gun2_x = 16'sd216 + $signed({6'b0, g2x_mul[19:10]});   // 216..903
+wire signed [15:0] gun2_y = 16'sd44  + $signed({8'b0, g2y_mul[15:8]});    // 44..283
+
 // Pocket Racer steering source: left-stick X, or the paddle when paddleMode is on
 // (joy0_xmuxed already handles that mux). Signed -128..127; half-scaled and reversed
 // into the wheel's 0x41-0xC0 span (inside MAME's legal 0x38-0xC8).
-wire signed [7:0] prc_stick = joy0_xmuxed;
+//
+// DIGITAL STEERING FALLBACK (2026-07-26): joy0_xmuxed carries ONLY the left analog stick
+// (or an armed NeGcon paddle), so on a d-pad or keyboard it stayed 0 and in_adc0 sat
+// permanently at 0x80 = centred — the car could not be steered at all. Ramp a virtual
+// wheel while Left/Right are held and spring it back to centre on release. The analog
+// stick still wins whenever it is deflected past a small deadzone, so wheel/stick users
+// are unaffected. ~258 Hz tick at clk_1x ~33.87 MHz => ~0.5 s from centre to full lock.
+// No clamping needed: prc_stick -127..127 maps to 0x41..0xC0, inside MAME's 0x38..0xC8.
+reg [16:0]       prc_steer_cnt = 17'd0;
+reg signed [7:0] prc_dig       = 8'sd0;
+always @(posedge clk_1x) begin
+   prc_steer_cnt <= prc_steer_cnt + 17'd1;
+   if (prc_steer_cnt == 17'd0) begin
+      if (joy[1] & ~joy[0]) begin                          // Left
+         if (prc_dig > -8'sd127) prc_dig <= prc_dig - 8'sd1;
+      end else if (joy[0] & ~joy[1]) begin                 // Right
+         if (prc_dig <  8'sd127) prc_dig <= prc_dig + 8'sd1;
+      end else begin                                       // auto-centre on release
+         if      (prc_dig > 8'sd0) prc_dig <= prc_dig - 8'sd1;
+         else if (prc_dig < 8'sd0) prc_dig <= prc_dig + 8'sd1;
+      end
+   end
+end
+wire signed [7:0] prc_analog     = joy0_xmuxed;
+wire              prc_analog_live = (prc_analog > 8'sd16) || (prc_analog < -8'sd16);
+wire signed [7:0] prc_stick      = prc_analog_live ? prc_analog : prc_dig;
 
 c76_sound c76snd
 (
@@ -1120,33 +1273,72 @@ c76_sound c76snd
    // My Angel 3 (keycus_id 0x09) PORT_MODIFY("PLAYER1"): 0x08=BTN1 0x04=BTN2 0x02=BTN3 0x01=BTN4
    // (the base joystick-direction bits become the 4 quiz buttons). Remap the low nibble to
    // Button1-4 (joy[4..7]) for 0x09; keep U/D/L/R (joy[3..0]) for every other game.
-   // NOTE: keycus 0x09 is shared with the (non-functional, no gun support) light-gun titles
-   // ptblank2/gunbarl — harmless there since those don't run.
-   .in_player1(~{joy[10],  joy[6],  joy[5],  joy[4],
+   // NOTE: keycus 0x09 covers My Angel 3 AND the light-gun titles ptblank2/gunbarl. For the gun
+   // games MAME's PORT_MODIFY leaves only 0x10 (BUTTON1 = TRIGGER) and 0x80 (START1) live, so the
+   // low-nibble remap below is a My Angel 3 mapping that is harmless on the gun games. Bit 4 is
+   // the trigger: OR in the mouse left button so a mouse can fire as well as a pad Button1.
+   .in_player1(~{joy[10],  joy[6],  joy[5],  (joy[4] | ((zn_keycus_id == 8'h09) & gun_trigger)),
                  (zn_keycus_id == 8'h09) ? {joy[4],  joy[5],  joy[6],  joy[7]}  : {joy[3],  joy[2],  joy[1],  joy[0]}}),
    .in_player2(~{joy2[10], joy2[6], joy2[5], joy2[4],
                  (zn_keycus_id == 8'h09) ? {joy2[4], joy2[5], joy2[6], joy2[7]} : {joy2[3], joy2[2], joy2[1], joy2[0]}}),
    // PLAYER4: bit4 (0x10) = Tekken P2 kick (joy2[6]) / Soul Edge P2 Guard (C409 0x02 -> joy2[7]);
    //          bit3 (0x08) = Pocket Racer (C432 0x07) BUTTON2 = view toggle (joy[5]) per MAME
    //          PORT_MODIFY("PLAYER4") 0x08; else unused.
-   .in_player4(~{2'b00, joy2[7], (zn_keycus_id == 8'h02) ? joy2[7] : joy2[6],
-                 (zn_keycus_id == 8'h07) ? joy[5] : 1'b0, 3'b000}),
-   .in_switch (~{status[95], status[94], joy[11], joy2[11], 2'b00, status[96], status[97]}),
+   // PLAYER4 is a normal digital port, unlike player 3. On the BASE namcos11 layout it is the
+   // full player-4 station (b7=START4 b6..b4=BTN3..1 b3=UP b2=DOWN b1=LEFT b0=RIGHT); every other
+   // layout repurposes just a couple of its bits, so only the base titles get the full mapping.
+   .in_player4(~(zn_generic_adc
+                 ? {joy4[10], joy4[6], joy4[5], joy4[4], joy4[3], joy4[2], joy4[1], joy4[0]}
+                 : {2'b00, joy2[7], (zn_keycus_id == 8'h02) ? joy2[7] : joy2[6],
+                    (zn_keycus_id == 8'h07) ? joy[5] : 1'b0, 3'b000})),
+   // SWITCH: b7=SERVICE1 b6=TEST b5=COIN1 b4=COIN2 b3=COIN3 b2=COIN4 b1:b0=DIPs.
+   // COIN3/COIN4 were hardcoded unpressed, so players 3 and 4 could not credit up even once their
+   // controls existed -- on a 4-player cabinet like Dunk Mania that alone makes them unusable.
+   // Driven only on the base layout: the tekken/myangel3 port sets mark these bits IPT_UNUSED.
+   .in_switch (~{status[95], status[94], joy[11], joy2[11],
+                 zn_generic_adc ? joy3[11] : 1'b0, zn_generic_adc ? joy4[11] : 1'b0,
+                 status[96], status[97]}),
    // Pocket Racer (KEYCUS C432): AN0 = steering (PADDLE centre 0x80, legal 0x38-0xC8,
    // reversed per MAME) from the left analog stick X, AN1 = throttle pedal (0x00
    // released, BTN1 = full). AN0 left at the 0xFF idle value reads as a wheel pegged
    // past its legal max -> the C76 flags a fault at shram 0xBD32 and the game never
    // boots. All other games keep the Tekken kick mapping on AN1/AN2 and 0xFF on AN0.
-   .in_adc0   ((zn_keycus_id == 8'h07) ? (8'h80 - {prc_stick[7], prc_stick[7:1]}) : 8'hFF),
+   .in_adc0   ((zn_keycus_id == 8'h07) ? (8'h80 - {prc_stick[7], prc_stick[7:1]})
+               : zn_generic_adc ? (joy3[6] ? 8'h00 : 8'hFF)            // P3 BUTTON3
+                                : 8'hFF),
+   // PLAYER 3 (base namcos11 layout) arrives ENTIRELY through the A-D converter -- there is no
+   // digital port for it. AN0/1/2 = BUTTON3/2/1, AN3=RIGHT AN4=LEFT AN5=DOWN AN6=UP, AN7=START3.
+   // Note this SUPERSEDES the earlier "gate ADC1/ADC2 to 0xFF" step for these titles: the problem
+   // was never that the channels were driven, it was that they were driven from PLAYER 1. They now
+   // get their rightful owner. Non-base titles keep 0xFF (they override these UNUSED in MAME).
+   .in_adc3   (zn_generic_adc ? (joy3[0] ? 8'h00 : 8'hFF) : 8'hFF),    // P3 RIGHT
+   .in_adc4   (zn_generic_adc ? (joy3[1] ? 8'h00 : 8'hFF) : 8'hFF),    // P3 LEFT
+   .in_adc5   (zn_generic_adc ? (joy3[2] ? 8'h00 : 8'hFF) : 8'hFF),    // P3 DOWN
+   .in_adc6   (zn_generic_adc ? (joy3[3] ? 8'h00 : 8'hFF) : 8'hFF),    // P3 UP
+   .in_adc7   (zn_generic_adc ? (joy3[10] ? 8'h00 : 8'hFF) : 8'hFF),   // START3
+   // ADC1/ADC2 PHANTOM-PLAYER-3 FIX (2026-07-26). MAME's BASE namcos11 port set maps
+   // ADC0/ADC1/ADC2 to PLAYER 3's BUTTON3/BUTTON2/BUTTON1 -- not to P1's. Only the titles that
+   // PORT_MODIFY those channels (the tekken layout, souledge, ptblank2, pocketrc) put P1 inputs
+   // there. We were driving ADC1=joy[7] and ADC2=joy[6] for EVERY non-Pocket-Racer title, so on
+   // the four base-layout games a P1 Button3 press -- a real, used button there (PLAYER1 0x40) --
+   // ALSO read as "Player 3 pressed Button1". Gate those titles off.
+   // Player 3 can never be a real input anyway: c76.vhd decodes only ADC ch0/1/2 (SFR 0x20/0x22/
+   // 0x24); ch3-7 (P3 joystick + START3) have no decode at all.
+   // keycus 0x09 is deliberately NOT gated: it is shared by My Angel 3 (MAME: all ADCs UNUSED) and
+   // Point Blank 2/Gunbarl (MAME: ADC1/ADC2 = P1 BUTTON4/BUTTON3, genuinely needed). ptblank2 wins;
+   // separating them would need a new MRA discriminator byte.
    // Pocket Racer AN1 = throttle PEDAL. MAME's ADC1 is IPT_PEDAL + PORT_REVERSE (MINMAX 0x00-0x7F),
    // so a RELEASED pedal reads 0x7F, full = 0x00. We had it inverted (released=0x00) -> the C76 saw
    // the pedal pinned "fully pressed" at boot (stuck-pedal) and never published the input-ready bit
    // at shram 0xBD32 -> MIPS hung at 0x80018C9C. Released = 0x7F, Button1 (accel) = 0x00.
    .in_adc1   ((zn_keycus_id == 8'h07) ? (joy[4] ? 8'h00 : 8'h7F)
+               : zn_generic_adc ? (joy3[5] ? 8'h00 : 8'hFF)           // P3 BUTTON2 (never P1)
+               : (zn_keycus_id == 8'h02) ? 8'hFF                      // Soul Edge: MAME UNUSED
                                        : (joy[7] ? 8'h00 : 8'hFF)),   // else: Tekken P1 BTN4 (right kick)
    // ADC2: Tekken = P1 BTN3 left kick (joy[6]); Soul Edge (C409, id 0x02) maps P1 BUTTON4
    // (Guard) to ADC2 per MAME PORT_MODIFY("ADC2") -> use joy[7] (Button4). Pocket Racer = idle.
    .in_adc2   ((zn_keycus_id == 8'h07) ? 8'hFF
+               : zn_generic_adc ? (joy3[4] ? 8'h00 : 8'hFF)            // P3 BUTTON1 (NOT P1's)
                : (zn_keycus_id == 8'h02) ? (joy[7] ? 8'h00 : 8'hFF)    // Soul Edge: ADC2 = P1 Guard
                                          : (joy[6] ? 8'h00 : 8'hFF)),  // Tekken: ADC2 = P1 BTN3 (left kick)
    .sprog_addr(c76_sprog_addr), .sprog_data(c76_sprog_data), .sprog_rd(c76_sprog_rd), .sprog_ready(c76_sprog_ready),
@@ -1156,11 +1348,20 @@ c76_sound c76snd
    .dbg_vwr(c352_vwr),
    .audio_l(c352_aud_l), .audio_r(c352_aud_r),
    .dbg_halted(c76_halted), .dbg_c352_seen(c76_c352_seen), .dbg_pc_out(c76_pc),
+   .dbg_ad_state(c76_ad_state),   // DIAG pocketrc A-D: [15]ADCON-start [14:8]ad_tick_cnt [7:0]AN0
    .dbg_first_pc(c76_first_pc), .dbg_pc_ever_bios(c76_ever_bios), .dbg_pc_ever_c098(c76_ever_c098),
    .dbg_c76_resp(c76_resp), .dbg_ram80(c76_ram80), .dbg_ram83(c76_ram83),
-   .dbg_opcode_out(c76_opcode), .dbg_brk_site_out(c76_brk_site), .dbg_mb_hs(c76_mb_hs)
+   .dbg_opcode_out(c76_opcode), .dbg_brk_site_out(c76_brk_site), .dbg_mb_hs(c76_mb_hs),
+   .dbg_rb_en(c76_rb_en), .dbg_rb_addr(jtag_addr[13:0]), .dbg_rb_q(c76_rb_q),
+   .dbg_coin(c76_coin), .dbg_ring_idx(jtag_addr[4:0]), .dbg_ring_q(c76_ring), .dbg_c76resp(c76_resp_lat)
 );
+wire [15:0] c76_coin;   // DIAG coin->C352 keyon: [15:8]=coin edges [7:0]=max keyons in ~0.5s after a coin
+wire [31:0] c76_ring;   // DIAG MIPS-command coin ring @ idx jtag_addr[4:0]: [31]valid [25:16]byte-off from 0xBD00 [15:0]data
+wire [31:0] c76_resp_lat; // DIAG C76 coin-response latches (mode 4): [31]bda4_seen [30]bd01_clr [29]bd00_seen [23:16]bda4_val [15:8]#C76-BDxx-writes [7:0]bd00_val
+wire        c76_rb_en = 1'b0;   // mode E dpram window disconnected for release   // mode E: steal MIPS port B to read dpram[jtag_addr[13:0]]
+wire [15:0] c76_rb_q;                                // dpram word read back
 wire [7:0]  c76_opcode;       // C76 last-fetched opcode (= the halting opcode when halted)
+wire [15:0] c76_ad_state;     // DIAG pocketrc A-D: [15]ADCON-start [14:8]ad_tick_cnt [7:0]AN0
 wire [23:0] c76_brk_site;
 wire [31:0] c76_mb_hs;      // C76 mailbox handshake forensics (see c76_sound.vhd)     // PC that took the last BRK before the derail
 wire        c76_halted;       // C76 hit an unimplemented opcode (crashed)
@@ -1610,6 +1811,10 @@ psx
    .zn_platform    (zn_platform_r[3:0]),
    .zn_system11    (zn_platform_r[4]),   // MRA platform byte bit4 = Namco System 11 mode
    .keycus_id      (zn_keycus_id),       // MRA index-1 byte[1]: 0=none, 1=C406 (Tekken 2)
+   .zn_gun1_x      (gun_x),              // System 11 GUN I/F (Point Blank 2 / Gunbarl, C443)
+   .zn_gun1_y      (gun_y),
+   .zn_gun2_x      (gun2_x),             // P2 gun = P2 pad left analog stick (no 2nd mouse exists)
+   .zn_gun2_y      (gun2_y),
    .ee_dl_wr       (ee_dl_wr),           // MRA index 9: EEPROM/nvram load
    .ee_dl_addr     (ee_dl_addr),
    .ee_dl_data     (ee_dl_data),
@@ -1740,7 +1945,7 @@ reg  [6:0]  mon_pdiv  = 7'd0;   // hold each phase ~128 re-reads (~0.25s) so the
 // Scan ANY SDRAM byte-address in seconds — no rebuild, no screenshot bit-decode.
 // (jtag_addr declared earlier, before the psx_mister instance, so it can drive .dbg_vram_coord)
 wire [31:0] zn_dbg_a0, zn_dbg_a1;
-wire [23:0] zn_dbg_eeprom_o;
+wire [31:0] zn_dbg_eeprom_o;
 wire [31:0] zn_dbg_gpu;
 wire [31:0] zn_dbg_disp;
 wire [31:0] zn_dbg_dma;
@@ -1811,23 +2016,16 @@ end
 //         [8]=GPUSTAT[23] display-disable [7:0]=0.  These are the exact bits that form
 //         FB_BASE (see the assign above), i.e. where the scaler is told to scan out from.
 //         A wrong DisplayOffsetY (e.g. stuck in the far half of VRAM) *is* cause (b) proven.
-wire [31:0] jtag_probe = (jtag_addr[31:28]==4'd1) ? 32'h0BADC0DE :   // mode 1 stripped for 20260720 release (VRAM readback; probe retained on feature/system11-titles)
-                         (jtag_addr[31:28]==4'd2) ? 32'h0BADC0DE :   // mode 2 stripped for 20260720 release (live MIPS PC; probe retained on feature/system11-titles)
-                         (jtag_addr[31:28]==4'd3) ? 32'h0BADC0DE :   // mode 3 stripped for 20260720 release (display/scanout state; probe retained on feature/system11-titles)
-
-                         (jtag_addr[31:28]==4'd4) ? 32'h0BADC0DE :   // mode 4 retired (pause/ce forensics)
-                         (jtag_addr[31:28]==4'd5) ? snd_triage :     // mode 5 KEPT: sound triage (c76stat.tcl)
-                         (jtag_addr[31:28]==4'd6) ? 32'h0BADC0DE :   // mode 6 retired (C352 voice-reg write)
-                         (jtag_addr[31:28]==4'd7) ? 32'h0BADC0DE :   // mode 7 retired (GPU procstate / errfifo_sticky — T2 instrument)
-                         (jtag_addr[31:28]==4'd8) ? 32'h0BADC0DE :   // mode 8: (T2 delivery ring removed)
-                         (jtag_addr[31:28]==4'd9) ? 32'h0BADC0DE :   // mode 9: (T2 delivery ring removed)
-
-                         (jtag_addr[31:28]==4'hA) ? 32'h0BADC0DE :   // mode A retired (C76 mailbox liveness)
-                         (jtag_addr[31:28]==4'hB) ? zn_dbg_gpustat : // mode B KEPT: GPUSTAT (boot liveness gate)
-                         (jtag_addr[31:28]==4'hC) ? 32'h0BADC0DE :
-                         (jtag_addr[31:28]==4'hD) ? c76_status :     // mode D KEPT: C76 health gate [31]halted [30]resp [29]ever_c098 [28]ever_bios [27]c352_seen [26]derailed [23:0]pc
-                         (jtag_addr[31:28]==4'hE) ? 32'h0BADC0DE :   // mode E retired (PIO/cpu2vram counters)
-                         (jtag_addr[31:28]==4'hF) ? 32'h0BADC0DE : 32'h0BADC0DE;  // VRAM readback default retired
+wire [31:0] jtag_probe = (jtag_addr[31:28]==4'd5) ? snd_triage :      // KEPT: sound triage (QA gate)
+                         (jtag_addr[31:28]==4'hB) ? zn_dbg_gpustat :  // KEPT: GPUSTAT (boot-liveness gate)
+                         (jtag_addr[31:28]==4'hD) ? c76_status :      // KEPT: C76 health gate
+                         32'h0BADC0DE;
+// RELEASE PROBE STRIP (2026-07-27, SYSTEM11-RELEASE-20260727): all forensic modes disconnected --
+// SDRAM/VRAM readback, MIPS PC, display state, gun diags (4/6/7), C76 A-D + mailbox forensics
+// (8/9/A/C/F) and the dpram window (E). Only the three QA-gate modes stay, exactly as the
+// 20260712/20260720 releases shipped: the automated boot test reads 5/B/D and stripping them would
+// blind it. No keep/preserve attributes are used, so synthesis prunes the upstream probe cones.
+// To restore the full set for debugging: git checkout feature/system11-titles -- SYSTEM11.sv  // mode F DIAG coin->C352 keyon: [15:8]coin-edges [7:0]max-keyons-after-coin
 altsource_probe #(
    .sld_auto_instance_index ("YES"),
    .sld_instance_index      (0),
@@ -2150,10 +2348,73 @@ typedef struct {
 vid_info video_aspect;
 vid_info video_gamma;
 
+// ===== Light-gun CROSSHAIR overlay (Point Blank 2 / Gunbarl) =====
+// The arcade cabinet draws NO crosshair — you aim a physical gun at the screen, and MAME's
+// crosshair is its own UI overlay (PORT_CROSSHAIR -> emu/crsshair.cpp), not game output. With a
+// mouse you cannot aim at what you cannot see, so the core has to draw one itself.
+// Derive pixel coordinates from the blanking edges rather than touching the GPU pipeline.
+// The gun counters map almost 1:1 onto the active area (X 216..903 = 688 wide, Y 44..283 = 240
+// tall), so subtracting the minimum gives a screen position directly.
+// OFF by default: keycus 0x09 is shared with My Angel 3 (not a gun game), and anyone using a real
+// Sinden/GunCon aims physically and does not want a synthetic crosshair.
+// MEASURE the real active area from the blanking edges — do not assume a resolution. h_act/v_act
+// are latched each line/frame and also read back on JTAG mode 6 to confirm the mapping on hardware.
+reg  [11:0] xh_hcnt = 12'd0;   // live pixel-in-line (also the running width)
+reg  [11:0] xh_vcnt = 12'd0;   // live line-in-frame (also the running height)
+reg  [11:0] h_act   = 12'd320;
+reg  [11:0] v_act   = 12'd240;
+reg         xh_hb_d = 1'b0;
+reg         xh_vb_d = 1'b0;
+reg  [11:0] xh_cx   = 12'd160;  // crosshair centre in ACTIVE-AREA pixels, refreshed per frame
+reg  [11:0] xh_cy   = 12'd120;
+reg  [11:0] xh2_cx  = 12'd160;  // P2 crosshair (drawn GREEN so the two players can tell them apart)
+reg  [11:0] xh2_cy  = 12'd120;
+wire [21:0] cx_mul  = gun_px * h_act;   // virtual 1024 wide  -> >>10
+wire [19:0] cy_mul  = gun_py * v_act;   // virtual  256 tall  -> >>8
+wire [21:0] c2x_mul = gun2_px * h_act;  // P2 shares the same virtual space, so the same mapping
+wire [19:0] c2y_mul = gun2_py * v_act;
+always @(posedge CLK_VIDEO) begin
+   if (ce_pix) begin
+      xh_hb_d <= video_gamma.hb;
+      xh_vb_d <= video_gamma.vb;
+      if (video_gamma.hb) begin
+         if (~xh_hb_d) begin                          // entering hblank: a line just ended
+            h_act   <= xh_hcnt;                       // latch measured active width
+            xh_hcnt <= 12'd0;
+            if (~video_gamma.vb) xh_vcnt <= xh_vcnt + 12'd1;
+         end
+      end else begin
+         xh_hcnt <= xh_hcnt + 12'd1;
+      end
+      if (video_gamma.vb & ~xh_vb_d) begin            // entering vblank: frame ended
+         v_act   <= xh_vcnt;                          // latch measured active height
+         xh_vcnt <= 12'd0;
+         xh_cx   <= cx_mul[21:10];                    // refresh crosshair once per frame (no tearing)
+         xh_cy   <= cy_mul[19:8];
+         xh2_cx  <= c2x_mul[21:10];
+         xh2_cy  <= c2y_mul[19:8];
+      end
+   end
+end
+wire [11:0] xh_dx = (xh_hcnt >= xh_cx) ? (xh_hcnt - xh_cx) : (xh_cx - xh_hcnt);
+wire [11:0] xh_dy = (xh_vcnt >= xh_cy) ? (xh_vcnt - xh_cy) : (xh_cy - xh_vcnt);
+wire        xhair = status[100] & (zn_keycus_id == 8'h09)
+                    & ~video_gamma.hb & ~video_gamma.vb
+                    & (((xh_dy == 12'd0) & (xh_dx <= 12'd6))     // horizontal arm
+                     | ((xh_dx == 12'd0) & (xh_dy <= 12'd6)));   // vertical arm
+// P2 crosshair: same geometry, but gated on p2_gun_active so a solo player never sees a stray
+// second reticle parked at screen centre. Drawn GREEN to distinguish it from P1's white.
+wire [11:0] xh2_dx = (xh_hcnt >= xh2_cx) ? (xh_hcnt - xh2_cx) : (xh2_cx - xh_hcnt);
+wire [11:0] xh2_dy = (xh_vcnt >= xh2_cy) ? (xh_vcnt - xh2_cy) : (xh2_cy - xh_vcnt);
+wire        xhair2 = status[100] & (zn_keycus_id == 8'h09) & p2_gun_active
+                    & ~video_gamma.hb & ~video_gamma.vb
+                    & (((xh2_dy == 12'd0) & (xh2_dx <= 12'd6))
+                     | ((xh2_dx == 12'd0) & (xh2_dy <= 12'd6)));
+
 assign CE_PIXEL = ce_pix;
-assign VGA_R    = video_gamma.red;
-assign VGA_G    = video_gamma.green;
-assign VGA_B    = video_gamma.blue;
+assign VGA_R    = xhair ? 8'hFF : xhair2 ? 8'h00 : video_gamma.red;
+assign VGA_G    = (xhair | xhair2) ? 8'hFF : video_gamma.green;
+assign VGA_B    = xhair ? 8'hFF : xhair2 ? 8'h00 : video_gamma.blue;
 assign VGA_VS   = video_gamma.vs;
 assign VGA_HS   = video_gamma.hs;
 assign VGA_DE   = ~(video_gamma.vb | video_gamma.hb);

@@ -524,6 +524,19 @@ begin
          bus_znio_write <= enableWrite;
       end if;
 
+      -- System 11 GUN I/F (Point Blank 2 / Gunbarl). The gun block sits at 0x1F780000/0x1F788000,
+      -- OUTSIDE the 0x1FAxxxxx I/O store, but address(20:0) of 0x1F780000 aliases exactly onto
+      -- 0x1FA00000's offset 0 -- so hand zn1_io a SYNTHETIC offset it can decode unambiguously.
+      -- 0x1F0000 / 0x1F8000 are unused by zn1_io's real map (mailbox 0x04000-0x0BFFF, keycus
+      -- 0x20000, EEPROM 0x30000).
+      if (address >= 16#1F780000# and address < 16#1F780010#) then
+         bus_znio_addr <= to_unsigned(16#1F0000#, 21) or resize(address(3 downto 0), 21);
+         bus_znio_read <= enableRead;
+      elsif (address >= 16#1F788000# and address < 16#1F788004#) then
+         bus_znio_addr  <= to_unsigned(16#1F8000#, 21) or resize(address(1 downto 0), 21);
+         bus_znio_write <= enableWrite;
+      end if;
+
    end process;
    
    bus_stall         <= bus_gpu_stall;
@@ -912,6 +925,25 @@ begin
                               s11_up_r <= '0';
                            end if;
                            state <= BUSWRITE;
+                        elsif (zn_system11 = '1' and
+                               ((mem_addressData(28 downto 0) >= 16#1F780000# and mem_addressData(28 downto 0) < 16#1F780010#) or
+                                (mem_addressData(28 downto 0) >= 16#1F788000# and mem_addressData(28 downto 0) < 16#1F788004#))) then
+                           -- System 11 GUN I/F PCB (Point Blank 2 / Gunbarl, KEYCUS C443).
+                           -- MAME namcos11.cpp ptblank2ua_map:
+                           --   0x1F780000-0F read  = lightgun_r (gun X/Y counters)
+                           --   0x1F788000-03 write = lightgun_w (LEDs + recoil solenoids)
+                           -- MUST be decoded BEFORE the S11 banked-ROM branch below, because
+                           -- 0x1F780000 lies INSIDE that region's 0x1F000000-0x1F7FFFFF window.
+                           -- Served by zn1_io over bus_znio using a synthetic offset (see the
+                           -- bus_znio_addr assignment) since address(20:0) of 0x1F780000 aliases
+                           -- onto 0x1FA00000's offset 0.
+                           ext_lastactive <= '0';
+                           if (mem_rnw = '0') then
+                              state   <= BUSWRITE;
+                           else
+                              state   <= BUSREADREQUEST;
+                              waitcnt <= 0;
+                           end if;
                         elsif (zn_system11 = '1' and mem_rnw = '1' and mem_addressData(28 downto 0) >= 16#1F000000# and mem_addressData(28 downto 0) < 16#1F800000#) then -- S11 banked ROM (8x1MB windows)
                            ram_ena         <= '1';
                            ram_cache       <= '0';

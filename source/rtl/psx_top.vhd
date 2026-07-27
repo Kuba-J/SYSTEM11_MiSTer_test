@@ -261,6 +261,11 @@ entity psx_top is
       zn_platform     : in  std_logic_vector(3 downto 0) := "0000";
       zn_system11     : in  std_logic := '0';  -- Namco System 11 memory map + boot-from-program
       keycus_id       : in  std_logic_vector(7 downto 0) := x"00";  -- System 11 KEYCUS type (0=none, 1=C406)
+      -- System 11 GUN I/F (Point Blank 2 / Gunbarl, C443): absolute gun counters, pre-clamped
+      zn_gun1_x       : in  std_logic_vector(15 downto 0) := (others => '0');
+      zn_gun1_y       : in  std_logic_vector(15 downto 0) := (others => '0');
+      zn_gun2_x       : in  std_logic_vector(15 downto 0) := (others => '0');
+      zn_gun2_y       : in  std_logic_vector(15 downto 0) := (others => '0');
       -- EEPROM/nvram (MRA index 9) load + save -> zn1_io EEPROM BRAM
       ee_dl_wr        : in  std_logic := '0';
       ee_dl_addr      : in  std_logic_vector(9 downto 0) := (others => '0');
@@ -285,7 +290,7 @@ entity psx_top is
       zn_debug_val    : out std_logic_vector(31 downto 0) := (others => '0');
       zn_dbg_a0       : out std_logic_vector(31 downto 0) := (others => '0');  -- spin-loop a0 register
       zn_dbg_a1       : out std_logic_vector(31 downto 0) := (others => '0');  -- spin-loop a1 register
-      zn_dbg_eeprom_o : out std_logic_vector(23 downto 0) := (others => '0');  -- {pend, readback, busy}
+      zn_dbg_eeprom_o : out std_logic_vector(31 downto 0) := x"BEEFDEAD";  -- DIAG mode 7: {BD4E,BD4C} mailbox store data
       zn_dbg_gpu      : out std_logic_vector(31 downto 0) := (others => '0');  -- GPU activity latches
       zn_dbg_disp     : out std_logic_vector(31 downto 0) := (others => '0');  -- {DispW, DispOffY, drawOffY}
       zn_dbg_dma      : out std_logic_vector(31 downto 0) := (others => '0');  -- {gpu_dmaReq, dma_wrEna, cnt}
@@ -708,7 +713,7 @@ architecture arch of psx_top is
    -- (climbs past 1312 = data not persisting) vs STUCK (plateaus < 1312 while MIPS spins).
    signal eeprom_wr_count        : unsigned(10 downto 0) := (others => '0');
    signal znio_wr_prev           : std_logic := '0';
-   signal zn_dbg_eeprom          : std_logic_vector(23 downto 0);
+   signal zn_dbg_eeprom          : std_logic_vector(31 downto 0);
    signal bus_znio_dataRead      : std_logic_vector(31 downto 0);
    signal zn_sec_select          : std_logic_vector(2 downto 0);  -- {data[7],data[3],data[2]}
    signal zn_coin_out            : std_logic_vector(7 downto 0);
@@ -2492,6 +2497,10 @@ begin
       coin_out     => zn_coin_out,
       zn_system11  => zn_system11,
       keycus_id    => keycus_id,
+      gun1_x       => zn_gun1_x,
+      gun1_y       => zn_gun1_y,
+      gun2_x       => zn_gun2_x,
+      gun2_y       => zn_gun2_y,
       s11_bank     => zn_s11_bank,
       s11_up       => zn_s11_up,
       mb_addr      => zn_mb_addr,
