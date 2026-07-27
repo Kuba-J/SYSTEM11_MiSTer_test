@@ -46,9 +46,20 @@ entity c76 is
       -- 2026-07-06: analog inputs (Tekken P1 kicks ride ADC ch1/ch2; idle = 0xFF)
       -- 2026-07-13: AN0 added — Pocket Racer's steering wheel (PADDLE, centre 0x80,
       -- legal range 0x38-0xC8 per MAME); AN1 doubles as its pedal (idle 0x00).
+      -- 2026-07-26: AN3-AN7 added for PLAYER 3. In MAME's BASE namcos11 port set the WHOLE of
+      -- player 3 arrives through the A-D converter (AN0/1/2 = BUTTON3/2/1, AN3=RIGHT AN4=LEFT
+      -- AN5=DOWN AN6=UP, AN7=START3); only the four base-layout titles use them (Dunk Mania,
+      -- Dancing Eyes, Star Sweep, Xevious 3D-G) -- every other port set overrides them UNUSED.
+      -- Until now they fell through to the 0x20-0x2F catch-all (0xFF = permanently unpressed),
+      -- so player 3 could never press anything.
       in_adc0    : in  std_logic_vector(7 downto 0) := x"FF";
       in_adc1    : in  std_logic_vector(7 downto 0) := x"FF";
       in_adc2    : in  std_logic_vector(7 downto 0) := x"FF";
+      in_adc3    : in  std_logic_vector(7 downto 0) := x"FF";
+      in_adc4    : in  std_logic_vector(7 downto 0) := x"FF";
+      in_adc5    : in  std_logic_vector(7 downto 0) := x"FF";
+      in_adc6    : in  std_logic_vector(7 downto 0) := x"FF";
+      in_adc7    : in  std_logic_vector(7 downto 0) := x"FF";
 
       -- external bus to the System 11 substrate (input ports, C352, shared RAM, SPROG)
       ext_addr   : out std_logic_vector(23 downto 0);
@@ -157,6 +168,8 @@ architecture arch of c76 is
    signal ad_cnt   : unsigned(11 downto 0) := (others=>'0');
    signal ad_tick  : std_logic := '0';
    signal ad_clear : std_logic := '0';
+   signal ad_tick_cnt : unsigned(6 downto 0) := (others=>'0');   -- DIAG: saturating count of A-D completions
+   signal m37_dbg     : std_logic_vector(15 downto 0);           -- DIAG: m37702 dbg_x = [15:8]A-D IRQs taken [0]irq_ad_pend
    signal tb1_tick   : std_logic := '0';
    signal tb1_armed  : std_logic := '0';
 
@@ -271,6 +284,16 @@ begin
    sfr_q   <= in_adc0 when (unsigned(cpu_addr(7 downto 0)) = x"20")
               else in_adc1 when (unsigned(cpu_addr(7 downto 0)) = x"22")
               else in_adc2 when (unsigned(cpu_addr(7 downto 0)) = x"24")
+              -- AN3-AN7 = player 3 (base namcos11 layout only). LOW byte only, deliberately
+              -- mirroring the proven AN1/AN2 kick channels: these carry DIGITAL 0x00/0xFF button
+              -- levels, so their high bytes stay on the 0xFF catch-all below rather than the 0x00
+              -- that AN0 needs (AN0 is a genuine ANALOG wheel, where a 16-bit read of 0xFF80 read
+              -- as "pegged past legal max" and hung Pocket Racer).
+              else in_adc3 when (unsigned(cpu_addr(7 downto 0)) = x"26")
+              else in_adc4 when (unsigned(cpu_addr(7 downto 0)) = x"28")
+              else in_adc5 when (unsigned(cpu_addr(7 downto 0)) = x"2A")
+              else in_adc6 when (unsigned(cpu_addr(7 downto 0)) = x"2C")
+              else in_adc7 when (unsigned(cpu_addr(7 downto 0)) = x"2E")
               -- Pocket Racer fix: AD0 high byte (10-bit A-D result bits 9:8) must be 0 for an 8-bit
               -- reading. It was 0xFF, so a 16-bit AD0 read of the steering (AN0) saw 0xFF80 (pegged
               -- past legal max) -> the C76 flagged a steering fault at shram 0xBD32 -> game hung
@@ -344,8 +367,14 @@ begin
          -- A-D conversion interrupt: IC_AD @SFR 0x70 (M37702 SFR map), vector 0xFFD6 -> ISR 0xC30D.
          prio_ad   => unsigned(sfr_mem(16#70#)(2 downto 0)),
          dbg_pc => dbg_pc, dbg_opcode => dbg_opcode,
-         dbg_valid => dbg_valid, dbg_halted => dbg_halted, dbg_x => dbg_x
+         dbg_valid => dbg_valid, dbg_halted => dbg_halted, dbg_x => m37_dbg
       );
+
+   -- DIAG (pocketrc A-D): repurpose dbg_x = ADCON-start bit | A-D completion count | AN0 value read.
+   --  [15]=sfr(0x1E) bit6 (A-D START, live)  [14:8]=ad_tick_cnt (A-D completions, saturating)  [7:0]=in_adc0
+   -- DIAG pocketrc: [15:8]=A-D IRQs actually TAKEN (m37702) ; [7:0]=IC_AD (sfr 0x70, A-D int ctrl;
+   -- bits2:0=priority — if 0 the A-D IRQ is never taken -> ISR 0xC30D never runs -> no 0xBD32 publish).
+   dbg_x <= m37_dbg;  -- DIAG mode8: [15:8]=INT0 IRQs taken [7:0]=INT2 IRQs taken
 
    -- ---- A-D converter (2026-07-05): minimal MAME-equivalent model -------------
    -- M37702 ADCON = SFR 0x1E: bit6 = conversion START, bit7? repeat mode bits vary; MAME's
@@ -372,6 +401,7 @@ begin
                   ad_cnt   <= (others=>'0');
                   ad_tick  <= '1';
                   ad_clear <= '1';               -- 1-cycle pulse: SFR process clears ADCON bit6
+                  if ad_tick_cnt /= "1111111" then ad_tick_cnt <= ad_tick_cnt + 1; end if;  -- DIAG
                else
                   ad_cnt <= ad_cnt + 1;
                end if;

@@ -90,9 +90,12 @@ architecture arch of m37702 is
    -- reads the MIPS cmd @0xBD34 and acks @0xBD32) never runs and Pocket Racer hangs. Latch the
    -- rising edge into a pending flag and clear it only when the IRQ is taken (== HOLD_LINE).
    signal irq0_pend, irq1_pend, irq2_pend : std_logic := '0';
+   signal int2_taken_cnt : unsigned(7 downto 0) := (others=>'0');  -- DIAG: # of INT2 (FFF0) IRQs taken
+   signal int0_taken_cnt : unsigned(7 downto 0) := (others=>'0');  -- DIAG: # of INT0 (FFF4) IRQs taken
    signal irq_tb0_pend : std_logic := '0';   -- Timer B0 interrupt pending (set on pulse, cleared when taken)
    signal irq_tb1_pend : std_logic := '0';   -- Timer B1 interrupt pending (the C76's 357x/run service tick @0xC31F)
    signal irq_ad_pend  : std_logic := '0';   -- A-D conversion-complete pending; vector 0xFFD6 -> ISR 0xC30D
+   signal ad_irq_cnt   : unsigned(7 downto 0) := (others=>'0');  -- DIAG: count of A-D IRQs actually TAKEN
    signal irq_ta2_pend : std_logic := '0';   -- Timer A2 pending; vector 0xFFF0
    signal irq_ta3_pend : std_logic := '0';   -- Timer A3 pending; vector 0xFFEE
 
@@ -259,7 +262,7 @@ begin
             regDT<=(others=>'0'); regDPR<=(others=>'0');
             pfx<=PFX_NONE; use_b<='0';
             irq0_l<='0'; irq1_l<='0'; irq2_l<='0';
-            irq0_pend<='0'; irq1_pend<='0'; irq2_pend<='0';
+            irq0_pend<='0'; irq1_pend<='0'; irq2_pend<='0'; int2_taken_cnt<=(others=>'0'); int0_taken_cnt<=(others=>'0');
             irq_tb0_pend<='0'; irq_tb1_pend<='0'; irq_ad_pend<='0';
             irq_ta2_pend<='0'; irq_ta3_pend<='0';
 
@@ -285,11 +288,17 @@ begin
                when ST_RST_LO_W =>
                   if bus_ready='1' then
                      regPC(7 downto 0) <= unsigned(bus_din);
+                     -- synthesis translate_off
+                     report "RESETVEC-LO bus_din=" & to_hstring(bus_din);
+                     -- synthesis translate_on
                      bus_addr <= x"00FFFF"; state <= ST_RST_HI_W;
                   end if;
                when ST_RST_HI_W =>
                   if bus_ready='1' then
                      regPC(15 downto 8) <= unsigned(bus_din);
+                     -- synthesis translate_off
+                     report "RESETVEC-HI bus_din=" & to_hstring(bus_din) & " -> full regPC lo already latched";
+                     -- synthesis translate_on
                      bus_rd<='0'; state<=ST_FETCH;
                   end if;
 
@@ -324,10 +333,13 @@ begin
                         when 7      => int_vec<=x"FFEA"; irq_ta2_pend<='0';  -- Timer A2 (MAME m37710_irq_vectors)
                         when 8      => int_vec<=x"FFE8"; irq_ta3_pend<='0';  -- Timer A3
                         when 6      => int_vec<=x"FFD6"; irq_ad_pend <='0';
+                                       if ad_irq_cnt /= x"FF" then ad_irq_cnt <= ad_irq_cnt + 1; end if;  -- DIAG
                         when 2      => int_vec<=x"FFE4"; irq_tb0_pend<='0';
                         when 3      => int_vec<=x"FFF0"; irq2_pend<='0';
+                                       if int2_taken_cnt /= x"FF" then int2_taken_cnt <= int2_taken_cnt + 1; end if;  -- DIAG
                         when 4      => int_vec<=x"FFF2"; irq1_pend<='0';
                         when others => int_vec<=x"FFF4"; irq0_pend<='0';
+                                       if int0_taken_cnt /= x"FF" then int0_taken_cnt <= int0_taken_cnt + 1; end if;  -- DIAG
                      end case;
                      int_pushpc<=regPC; int_step<=(others=>'0'); state<=ST_INT_PUSH;
                   else
@@ -1422,6 +1434,6 @@ begin
       end if;
    end process;
 
-   dbg_x <= std_logic_vector(regX);
+   dbg_x <= std_logic_vector(int0_taken_cnt) & std_logic_vector(int2_taken_cnt);  -- DIAG: [15:8]=INT0 IRQs taken [7:0]=INT2 IRQs taken
 
 end architecture;

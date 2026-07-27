@@ -1,66 +1,97 @@
 <p align="center">
   <img src="art/XelaNotPu-LogoTransparent-GithubSocial.png" alt="SYSTEM11 MiSTer banner" width="100%">
 </p>
+# Namco System 11 for MiSTer
 
-## Changes in this release (2026-07-21)
+FPGA implementation of the [Namco System 11](https://en.wikipedia.org/wiki/Namco_System_11) arcade board for the [MiSTer platform](https://github.com/MiSTer-devel/Main_MiSTer/wiki).
 
-- **C76 interrupt delivery hardened** — the M37702 sound MCU now latches external
-  INT0/INT1/INT2 with HOLD_LINE semantics, so it no longer drops the periodic
-  60 Hz service interrupts under load. Improves sound-command and I/O reliability.
-- **Soul Edge — dead Kick and Guard buttons fixed.** The P1 Kick input (driven
-  onto IN1 BUTTON3 instead of being tied off) and the Guard input (P1 ADC2 /
-  P2 PLAYER4) are now wired correctly, gated on the C409 KEYCUS so Tekken is
-  unaffected. (Kick fix hardware-confirmed.)
-- **My Angel 3 — quiz-panel button remap** so the four answer buttons register
-  (per-game gated on the C443 KEYCUS).
-- **Pocket Racer — analog steering/throttle plumbing corrected** (A-D result
-  high byte and throttle-pedal polarity). Pocket Racer still does not boot into
-  gameplay (a C76 shared-RAM handshake blocks it), but the analog path is now
-  correct for when that boot issue is resolved.
-- **Settings now save (EEPROM/nvram persistence).** The AT28C16 settings EEPROM
-  is persisted to a `.nvm` file on the SD card, so test-menu options (difficulty,
-  sound, coinage, high scores, ...) survive a power cycle. Note: Namco System 11
-  test menus commit settings to EEPROM only when you **exit test mode** (turn the
-  Service/Test switch off) — that write is what triggers the save.
+Namco System 11 (1994) is an arcade board built around Sony PlayStation technology: an R3000A-compatible MIPS CPU, a System 11 GPU (CXD8538Q) with 2 MB VRAM, and main RAM — paired with Namco-specific hardware that has no PlayStation equivalent: banked game ROM in place of a CD drive, a Namco C76 (Mitsubishi M37702) MCU handling sound and cabinet I/O, the Namco C352 32-voice PCM sound chip, and per-game KEYCUS protection chips. This core implements all of the above, including the C76 coprocessor and C352 sound.
+
+The core is derived from the excellent [PSX_MiSTer](https://github.com/MiSTer-devel/PSX_MiSTer) core by **Robert Peip (FPGAzumSpass)**, which provides the CPU, GPU, GTE, DMA, and memory subsystem foundation.
+
+## Changes in this release (2026-07-27)
+
+- **C76 mailbox write-lane bug fixed — this is the important one.** The shared-RAM
+  mailbox between the MIPS and the C76 sound MCU selected its 16-bit halfword from
+  address bit 1 alone, but the CPU issues *word-aligned* addresses with byte
+  enables for a halfword store. Every high-halfword write therefore landed in the
+  **low** halfword of the same word, clobbering it, and odd halfwords were never
+  writable at all. Consequences now fixed:
+  - **Pocket Racer boots and plays.** The corrupted mailbox descriptor meant its
+    command packet was never built, so the game sat forever on a black screen.
+  - **One-shot sound effects no longer drop.** The Tekken 2 insert-coin effect —
+    and other one-shots that travelled over the same mailbox — now play.
+  - C76 command delivery is measurably more reliable across all titles.
+- **Light-gun support added (Point Blank 2, Gunbarl).** The System 11 GUN I/F
+  register block is implemented, aimed with a USB mouse, with left-click as the
+  trigger. A new **Light Gun** OSD page adds an optional on-screen crosshair and a
+  sensitivity setting.
+- **Second light gun (2-player Point Blank 2 / Gunbarl).** Both guns previously
+  shared one pointer, so co-op was impossible. Player 2 now aims with its own pad —
+  left analog stick or D-pad — and gets its own green crosshair. MiSTer exposes a
+  single merged PS/2 mouse stream, so a second *mouse* is not reachable from a core;
+  the pad is the only independent pointing device available.
+- **Players 3 and 4 supported (Dunk Mania).** Dunk Mania is a four-player cabinet
+  and the core capped at two. Player 3's entire station arrives through the C76's
+  A-D converter, of which only three of the eight channels were decoded — the five
+  carrying its stick and Start read as permanently unpressed. Those are now
+  decoded, Player 4's port is driven, and **players 3 and 4 can insert coins**
+  (their coin inputs were also hardwired to "never pressed"). All four stations
+  have been verified joining a match on real hardware.
+- **Phantom Player-3 inputs removed.** On the four titles that use MAME's base
+  port layout — Dunk Mania, Dancing Eyes, Star Sweep, Xevious 3D-G — three A-D
+  channels belong to *player 3*, but the core drove them from player 1. Since
+  Button 3 is a real, used button on those games, every legitimate press was also
+  read as "player 3 pressed a button". Those channels now carry player 3.
+- **Three more titles now ship:** Pocket Racer, Point Blank 2 and Gunbarl —
+  eleven playable titles in total, up from nine.
+- **All eleven titles confirmed reaching gameplay on hardware**, not just attract
+  mode: the six that had never been play-tested (Dunk Mania, Dancing Eyes, Star
+  Sweep, Xevious 3D-G, Prime Goal EX, My Angel 3) were driven through coin, start
+  and in-game input and verified in play.
+- **Soul Edge Kick and Guard confirmed working** in play (both inputs are gated on
+  the C409 KEYCUS, so other titles are unaffected).
+- Pocket Racer's steering also accepts the **D-pad** now, not just an analog
+  stick, with auto-centring.
 
 ## Supported Games
 
 | Game | Status | Notes |
 |------|--------|-------|
 | Tekken (World, TE2/VER.C) | **Playable** | Gameplay, sound effects, music, FMV intros and attract mode all work. Three regional alternates provided. |
-| Tekken 2 Ver.B (World, TES2/VER.B) | **Playable** | Verified on hardware: boots, renders, music and inputs all work. All eight revisions ship (seven as alternates), each boot-tested. |
-| Soul Edge Ver. II (SO4/VER.C) | **Playable**  | KEYCUS C409 |
-| Dunk Mania (DM2/VER.C) | Boots + attract | KEYCUS C410; slow first boot (~2 min) |
-| Xevious 3D/G (XV32/VER.B) | Boots + attract | KEYCUS C430 |
-| Prime Goal EX (PG1/VER.A) | Boots + attract | KEYCUS C411 |
-| Dancing Eyes (DC2/VER.B) | **Playable**  | KEYCUS C431 |
-| Star Sweep (STP1/VER.A) | Boots + attract | KEYCUS C442 |
-| Kosodate Quiz My Angel 3 (KQT1/VER.A) | Boots + attract | KEYCUS C443 + rom8_64 32 MB banking |
+| Tekken 2 Ver.B (World, TES2/VER.D) | **Playable** | Boots, renders, music and inputs all work. This is MAME's `tekken2` parent set and the gameplay-verified revision. All eight revisions ship (seven as alternates), each boot-tested. |
+| Pocket Racer (Japan, PKR1/VER.B) | **Playable** | KEYCUS C432. New this release — plays with music and sound effects. Steering on the analog stick or D-pad, accelerate on Button 1. |
+| Point Blank 2 (World, GNB2/VER.A) | **Playable (light gun)** | KEYCUS C443. New this release — aim with a USB mouse, left-click to shoot. Three alternates plus Gunbarl. |
+| Gunbarl (Japan, GNB1/VER.A) | **Playable (light gun)** | The Japanese release of Point Blank 2; ships as a Point Blank 2 alternate. |
+| Soul Edge Ver. II (SO4/VER.C) | **Playable** | KEYCUS C409. Kick and Guard confirmed working. |
+| Dunk Mania (DM2/VER.C) | **Playable** | KEYCUS C410; slow first boot (~2 min) |
+| Xevious 3D/G (XV32/VER.B) | **Playable** | KEYCUS C430 |
+| Prime Goal EX (PG1/VER.A) | **Playable** | KEYCUS C411 |
+| Dancing Eyes (DC2/VER.B) | **Playable** | KEYCUS C431 |
+| Star Sweep (STP1/VER.A) | **Playable** | KEYCUS C442 |
+| Kosodate Quiz My Angel 3 (KQT1/VER.A) | **Playable** | KEYCUS C443 + rom8_64 32 MB banking |
 
-The seven new titles pass their KEYCUS protection checks and render their
-attract sequences on hardware; gameplay depth-testing at the Tekken level is in
-progress. **Pocket Racer** does not boot yet (a C76 shared-RAM handshake blocks
-it — under investigation; its analog wheel plumbing is already in the core).
-Point Blank 2 (lightgun; no ROM verified) and Family Bowl (H8/3002 sub-board)
-are out of scope.
+**Family Bowl** remains out of scope
 
 ## Contents
 
 ```
-RELEASE-20260720/
+SYSTEM11-RELEASE-20260727/
 ├── release/                       ← copy onto your MiSTer SD card
 │   └── _Arcade/
-│       ├── <one primary .mra per game (9 games)>
-│       ├── _alternatives/
-│       │   ├── _Tekken/           ← World VER.B, Asia VER.C, Japan VER.B
-│       │   ├── _Tekken 2/         ← the other 7 revisions (incl. gameplay-verified World TES2-VER.D)
-│       │   ├── _Soul Edge/        ← World/US/Japan VER.A, Ver. II US VER.C
-│       │   ├── _Dunk Mania/       ← Japan DM1-VER.C
-│       │   ├── _Xevious 3D-G/     ← World VER.A, Japan XV31-VER.A
-│       │   ├── _Dancing Eyes/     ← US DC3-VER.C, Japan DC1-VER.A
-│       │   └── _Star Sweep/       ← Japan STP1-VER.A
+│       ├── <one primary .mra per game (11 games)>
+│       ├── _alternatives/         ← 24 regional / revision variants
+│       │   ├── _Tekken/           ← World VER.B, Asia VER.C, Japan VER.B                    (3)
+│       │   ├── _Tekken 2/         ← the other 7 revisions                                   (7)
+│       │   ├── _Point Blank 2/    ← US GNB3-VER.A, World VER.A alt, World unknown,
+│       │   │                        plus Gunbarl (Japan GNB1-VER.A)                         (4)
+│       │   ├── _Soul Edge/        ← World/US/Japan VER.A, Ver. II US VER.C                  (4)
+│       │   ├── _Dancing Eyes/     ← US DC3-VER.C, Japan DC1-VER.A                           (2)
+│       │   ├── _Xevious 3D-G/     ← World VER.A, Japan XV31-VER.A                           (2)
+│       │   ├── _Dunk Mania/       ← Japan DM1-VER.C                                         (1)
+│       │   └── _Star Sweep/       ← Japan STP1-VER.A                                        (1)
 │       └── cores/
-│           └── XNSYSTEM11_20260720.rbf   ← the FPGA core bitstream
+│           └── XNSYSTEM11_20260727.rbf   ← the FPGA core bitstream
 └── source/                        ← full corresponding FPGA source (build it yourself)
 ```
 
@@ -83,8 +114,8 @@ ROMs are **not** included with this project and are not linked from it — see [
 | Tekken (World TE2 Ver.B).mra | `tekkenb.zip` + `tekken.zip` + `namcoc76.zip` |
 | Tekken (Asia TE4 Ver.C).mra | `tekkenac.zip` + `tekken.zip` + `namcoc76.zip` |
 | Tekken (Japan TE1 Ver.B).mra | `tekkenjb.zip` + `tekken.zip` + `namcoc76.zip` |
-| Tekken 2 Ver.B (World TES2-VER.B).mra | `tekken2b.zip` (or merged `tekken2.zip`) + `namcoc76.zip` |
-| Tekken 2 alternates (7 MRAs) | revision zip (`tekken2a/ua/ub/ud/jb/jc`) or merged `tekken2.zip`, + `namcoc76.zip` |
+| Tekken 2 Ver.B (TES2-VER.D).mra | `tekken2.zip` + `namcoc76.zip` |
+| Tekken 2 alternates (7 MRAs) | revision zip (`tekken2b/a/ua/ub/ud/jb/jc`) or merged `tekken2.zip`, + `namcoc76.zip` |
 | Soul Edge Ver. II (SO4-VER.C).mra | `souledge.zip` + `namcoc76.zip` |
 | Dunk Mania (DM2-VER.C).mra | `dunkmnia.zip` + `namcoc76.zip` |
 | Xevious 3D-G (XV32-VER.B).mra | `xevi3dg.zip` + `namcoc76.zip` |
@@ -118,7 +149,31 @@ Tekken uses an 8-way joystick and four buttons per player, plus Start and Coin:
 | Coin | Insert coin | Select |
 | Pause | Pause the core | L3 |
 
-Two players are supported. The cabinet TEST and SERVICE switches are available as OSD toggles (see below), so the operator test menu can be reached without dedicated buttons.
+The cabinet TEST and SERVICE switches are available as OSD toggles (see below), so the operator test menu can be reached without dedicated buttons.
+
+**Players 3 and 4 (Dunk Mania).** Dunk Mania is a four-player cabinet: plug in up
+to four pads and each player coins up and joins at their own station. The other
+titles are one- or two-player and simply ignore the extra pads.
+
+**Light-gun titles (Point Blank 2, Gunbarl).** Player 1 plugs in a USB mouse: move
+to aim, **left-click to shoot**. Button 1 on a pad also acts as the trigger.
+
+*Two-player light gun:* player 2 aims with its **pad** — left analog stick, or the
+D-pad if you have no analog. Deflection steers the pointer like a trackball (hold
+to glide, release to hold position) rather than snapping back to the screen centre
+the way a self-centring stick otherwise would. MiSTer merges every physical mouse
+into one stream, so a second mouse cannot be assigned to player 2.
+
+The real cabinet draws no crosshair — you point a physical gun at the screen — so
+the core's crosshair is an optional aid, off by default (OSD → Light Gun). Player 1's
+is white and player 2's is green; player 2's only appears once player 2 moves or
+fires. Adjust *Gun Sensitivity* to suit your mouse's DPI (it also scales the pad
+pointer's speed).
+
+**Pocket Racer.** Steer with the left analog stick or the D-pad (which ramps
+toward full lock and springs back to centre); Button 1 accelerates; Button 2
+changes the camera view. The game has no Start button — insert a coin and it
+begins.
 
 ## OSD Options
 
@@ -130,6 +185,10 @@ Two players are supported. The cabinet TEST and SERVICE switches are available a
   - `Boot Debug Overlay` — diagnostic overlay during boot (off by default)
   - `Test Mode` — asserts the cabinet TEST switch (enters the operator test menu)
   - `Service Mode` — asserts the cabinet SERVICE switch (service credit)
+- **Light Gun** (Point Blank 2 / Gunbarl)
+  - `Crosshair` — draw an on-screen crosshair (default **Off**; the real cabinet
+    draws none, and it is unwanted if you use a real light gun)
+  - `Gun Sensitivity` — mouse-to-wheel divisor: 1/4 (default), 1/8, 1/2, 1/1
 - **Reset** — resets the board
 
 Opening the OSD pauses the core. Video scaling/aspect options are currently handled by the MiSTer framework defaults; the core-specific video/audio option page is disabled in this release.
@@ -138,10 +197,17 @@ Opening the OSD pauses the core. Video scaling/aspect options are currently hand
 
 - **Sound fidelity**: the C76/C352 sound engine plays correctly, but is still being
   tuned against real hardware. Feedback is welcome.
-- **Pocket Racer** does not boot yet: the MIPS waits on a C76 shared-RAM handshake
-  that never completes (KEYCUS is verified good — the exchange is bus-exact vs MAME in
-  simulation). Analog wheel/pedal plumbing is already present for when it is fixed.
-- All eight System 11 KEYCUS chips (C406, C409, C410, C411, C430, C431, C432, C442,
+- **Long-session display blank (rare).** During soak testing a build has been seen
+  to blank its video output for ~46 minutes while the game itself kept running
+  (sound and inputs alive, OSD working), then recover on its own. The root cause
+  is **not established** — an earlier cross-clock-margin explanation was
+  investigated and retracted as unproven — so this is disclosed rather than
+  claimed fixed.
+- **Timing closure.** The bitstream does not fully meet static timing analysis
+  (negative setup slack on the HDMI PLL clock and, marginally, on one core clock
+  output). No functional failure has been traced to it, and it is not the cause of
+  the blank above, but it is a real defect and is being worked on.
+- All nine System 11 KEYCUS chips (C406, C409, C410, C411, C430, C431, C432, C442,
   C443) are implemented and hardware-verified. GPU type is selected per game
   (Tekken 1 = CXD8538Q/coh100; every other title = CXD8561Q/coh110, per MAME).
 - **This core targets System 11 hardware only.** PlayStation console features inherited

@@ -108,9 +108,22 @@ entity zn1_io is
       -- the timeout poll and hang before game code).
       dbg_poll_val   : out std_logic_vector(15 downto 0) := (others => '0');
       dbg_poll_bit80 : out std_logic := '0';
-      -- DIAG 2026-06-25: {last-written EEPROM byte, last EEPROM read-back byte (lane0), busy_count}
-      -- latched on each EEPROM read to diagnose the stuck data-poll verify @0x8003E690.
-      dbg_eeprom     : out std_logic_vector(23 downto 0) := (others => '0');
+      -- System 11 GUN I/F PCB (Point Blank 2 / Gunbarl, KEYCUS C443). Absolute gun counters,
+      -- already clamped upstream to MAME's legal spans (X 0x0D8-0x387, Y 0x02C-0x11B).
+      -- memorymux maps the real 0x1F780000-0F block here as synthetic offset 0x1F0000-0x1F000F.
+      gun1_x       : in  std_logic_vector(15 downto 0) := (others => '0');
+      gun1_y       : in  std_logic_vector(15 downto 0) := (others => '0');
+      gun2_x       : in  std_logic_vector(15 downto 0) := (others => '0');
+      gun2_y       : in  std_logic_vector(15 downto 0) := (others => '0');
+      -- DIAG 2026-07-26 (pocketrc, REPURPOSED from the old EEPROM/keycus capture — both solved):
+      -- latch the DATA the MIPS actually presents to the mailbox when the ring-descriptor init
+      -- routine (0x80018BE0-0x80018C48) stores BD4C and BD4E. Golden = B200 / B600; HW dpram
+      -- reads back 0000 / B800. This separates load-side from store-side:
+      --   B600_B200 -> data was CORRECT at the store  => the dpram/store path lost it
+      --   B800_0000 -> the CPU delivered WRONG data   => the load (lhu from RAM) is corrupt
+      --   BEEF_DEAD -> the write never reached this address at all (address-side fault)
+      -- Sentinels (not flags) distinguish "never written" from "wrote zero" in 32 bits.
+      dbg_eeprom     : out std_logic_vector(31 downto 0) := x"BEEFDEAD";
       -- DIAG 2026-07-06: do the MIPS bank-register writes (sh 0x1FA10020-2F) ever ARRIVE here?
       -- [31:28]=count of writes hitting the 0x10020-0x1002F compare, [27:24]=count of ANY write
       -- with addr(16)=1, [23:16]=last data_write(23:16), [15:8]=last data_write(7:0), [7:0]=last addr(7:0).
@@ -151,6 +164,15 @@ architecture arch of zn1_io is
    signal bankwr_d23  : std_logic_vector(7 downto 0) := (others => '0');
    signal bankwr_d7   : std_logic_vector(7 downto 0) := (others => '0');
    signal bankwr_addr : std_logic_vector(7 downto 0) := (others => '0');
+   -- DIAG 2026-07-26 (pocketrc): one-shot capture of the mailbox store data for BD4C / BD4E.
+   -- Sentinel init (DEAD/BEEF) so "never stored" is distinguishable from "stored zero".
+   -- DIAG: GUN I/F read observability (see the mode-7 probe below)
+   signal gun_rd_cnt : std_logic_vector(7 downto 0)  := (others => '0');
+   signal gun_rd_adr : std_logic_vector(7 downto 0)  := (others => '0');
+   signal gun_rd_dat : std_logic_vector(15 downto 0) := (others => '0');
+   -- mailbox halfword index + write lane (see the FIX note at the mb_addr assignment)
+   signal mb_idx    : unsigned(13 downto 0);
+   signal mb_wr_hi  : std_logic;
    -- registered data_read (regular regs); the mailbox path overrides it combinationally
    signal data_read_r : std_logic_vector(31 downto 0) := (others => '0');
    -- mailbox read select, registered 1 cycle to match the dpram's 1-cycle read latency
@@ -160,6 +182,11 @@ architecture arch of zn1_io is
    signal mb_hi_d     : std_logic := '0';
    -- KEYCUS parameter registers (game-written, chip-specific offsets)
    signal kc_p1, kc_p2, kc_p3 : std_logic_vector(15 downto 0) := (others => '0');
+   -- DIAG (pocketrc C432): capture the first C432 EXCHANGE read (p2=0xEFFF), sticky.
+   --  [23]=guard_pass [18:16]=offset addr(4:2) [15:0]=returned data_read_r (1 cycle later)
+   signal kc_cap     : std_logic_vector(23 downto 0) := (others => '0');
+   signal kc_capdone : std_logic := '0';
+   signal kc_rpend   : std_logic := '0';
    -- DIAGNOSTIC: registered mb_addr (to detect the poll word 0x3E99 one cycle later,
    -- aligned with the dpram read latency) + the captured poll value / bit-0x80 latch.
    signal mb_addr_d   : std_logic_vector(13 downto 0) := (others => '0');
@@ -391,13 +418,26 @@ begin
    -- read, and memorymux's BUSREADREQUEST->BUSREAD gives only 1 cycle, so the address
    -- must be presented immediately and the read data muxed in combinationally (gated by
    -- the 1-cycle-delayed mb_sel_d) rather than through zn1_io's registered data_read_r.
-   -- addr carries bit 1 (halfword resolution), so (addr-0x4000)>>1 selects the EXACT
-   -- 16-bit shared word (even or odd). The MIPS bus places sh data positionally:
-   -- addr(1)=1 -> data in [31:16], addr(1)=0 -> [15:0] (cpu.vhd SH). Pick that lane
-   -- for the write, and on read place mb_rdata into the lane the CPU's lhu extracts
-   -- (using mb_hi_d = addr(1) registered to align with the dpram's 1-cycle read).
-   mb_addr   <= std_logic_vector(resize(shift_right(unsigned(addr) - 16#4000#, 1), 14));
-   mb_wdata  <= data_write(31 downto 16) when addr(1) = '1' else data_write(15 downto 0);
+   -- ⭐ FIX 2026-07-26 (HW-PROVEN, Pocket Racer): the old comment here claimed "addr carries bit 1
+   -- (halfword resolution)" for BOTH reads and writes. That is TRUE FOR READS but FALSE FOR WRITES:
+   -- a JTAG capture of the low byte of `addr` for the first four mailbox stores returned
+   --     BD44 BD48 BD48 BD4C   for program order   BD46 BD48 BD4A BD4C
+   -- i.e. every STORE arrives WORD-ALIGNED (bit 1 stripped) with the halfword selected by the byte
+   -- enables in write_mask, because the CPU emits a word address + byte enables for SH.
+   -- Consequence of the old code: addr(1) was always '0' on a store, so EVERY high-halfword store
+   -- was written into the LOW halfword of the same word, clobbering it, and odd halfwords were
+   -- never writable by the MIPS at all. That corrupted the C76 mailbox ring descriptor
+   -- (BD48/BD4C forced to 0000, BD4A/BD4E never written) so the "DAI" command packet was never
+   -- built and Pocket Racer spun forever in the response scan at 0x80018F04.
+   -- FIX: take the write lane from write_mask; keep addr(1) for reads (loads do carry the full
+   -- byte address — Tekken's mailbox reads of odd halfwords work).
+   mb_idx    <= resize(shift_right(unsigned(addr) - 16#4000#, 1), 14);
+   mb_wr_hi  <= '1' when write_mask(3 downto 2) /= "00" else '0';
+   -- reads: index straight from addr (bit 1 valid). writes: addr is word-aligned so mb_idx is even
+   -- and the true halfword index is mb_idx with bit 0 = the byte-enable-derived lane.
+   mb_addr   <= std_logic_vector(mb_idx(13 downto 1) & mb_wr_hi) when write_en = '1'
+                else std_logic_vector(mb_idx);
+   mb_wdata  <= data_write(31 downto 16) when mb_wr_hi = '1' else data_write(15 downto 0);
    mb_we     <= '1' when (zn_system11 = '1' and write_en = '1'
                           and unsigned(addr) >= 16#4000# and unsigned(addr) <= 16#BFFF#) else '0';
    -- FIX 2026-06-27: deliver the EEPROM read COMBINATIONALLY on ee_rd_pulse_d (the read select delayed
@@ -424,7 +464,52 @@ begin
          end if;
       end if;
    end process;
-   dbg_eeprom <= dbg_ee_pend & dbg_ee_rd & dbg_ee_busy;
+   -- DIAG 2026-07-26 (pocketrc ring-descriptor init): latch the data the MIPS presents to the
+   -- mailbox for the BD4C and BD4E stores (init routine 0x80018BE0-0x80018C48, which only does
+   -- `lhu v0,0x41XX(v0)` then `sh v0,0xNN(v1)`). Golden stores B200 then B600; HW dpram reads back
+   -- 0000 and B800. Latching mb_wdata AT THE STORE tells us which side is broken:
+   --   B600_B200 => correct here, so the dpram/store path corrupted it
+   --   B800_0000 => already wrong here, so the lhu load from RAM is corrupt
+   --   BEEF_DEAD => the store never hit this address (address decode / never executed)
+   -- One-shot (first write wins) so a later retry pass can't overwrite the boot-time evidence.
+   -- ROUND 2 (2026-07-26): round 1 showed BD4C was presented CORRECTLY (B200) yet the dpram holds
+   -- 0000, and NO store ever arrived at addr 0xBD4E (sentinel survived) although the dpram there
+   -- holds B800. That is an ADDRESS symptom, not a data one. So capture the actual low byte of
+   -- `addr` for the first FOUR mailbox stores in 0xBD44..0xBD53, oldest-first in the high byte:
+   --   44 48 4C 50 => addr is WORD-ALIGNED (bit1 stripped): every high-halfword store is
+   --                  mis-targeted onto the low halfword, clobbering it. zn1_io's
+   --                  "addr carries bit 1" assumption (line ~415) would be wrong.
+   --   46 48 4C 4E => halfword resolution is fine and the fault is elsewhere.
+   -- ROUND 3: the write fix above assumes READS still carry bit 1 (only stores are word-aligned).
+   -- Validate it: capture the low byte of `addr` for the first 4 mailbox READS around BD32, which
+   -- the MIPS polls and which is an ODD halfword.
+   --   32 ... => reads DO carry bit 1  -> the write-only fix is complete
+   --   30 ... => reads are word-aligned too -> the read path needs its own fix (bigger change:
+   --             the 16-bit dpram cannot serve both halfwords of a word in one access)
+   -- ROUND 4 (2026-07-26, "no crosshair"): does the MIPS EVER read the GUN I/F block, and what do
+   -- we hand back? Splits the two candidate causes: game never reads the gun (decode/mapping wrong,
+   -- or the game simply isn't in a gun-drawing state) vs game reads it but gets a bad value.
+   --   mode 7 = [31:24] saturating count of gun-block reads
+   --            [23:16] low byte of the synthetic addr of the last one (expect 00/04/06/08/0C/0E)
+   --            [15:0]  the 16-bit value returned on that read
+   process(clk) begin
+      if rising_edge(clk) then
+         if zn_system11 = '1' and read_en = '1'
+            and unsigned(addr) >= 16#1F0000# and unsigned(addr) <= 16#1F000F# then
+            if gun_rd_cnt /= x"FF" then
+               gun_rd_cnt <= std_logic_vector(unsigned(gun_rd_cnt) + 1);
+            end if;
+            gun_rd_adr <= std_logic_vector(addr(7 downto 0));
+            case addr(3 downto 2) is
+               when "00"   => gun_rd_dat <= gun1_x;
+               when "01"   => gun_rd_dat <= gun1_y;
+               when "10"   => gun_rd_dat <= gun2_x;
+               when others => gun_rd_dat <= gun2_y;
+            end case;
+         end if;
+      end if;
+   end process;
+   dbg_eeprom <= gun_rd_cnt & gun_rd_adr & gun_rd_dat;
 
    -- DIAG 2026-07-06: bank-write arrival probe. Counts saturate at 15 (sticky).
    -- Deliberately OUTSIDE the zn_system11 guard so an arrival is counted even if
@@ -464,6 +549,7 @@ begin
             kc_p1 <= (others => '0');       -- MAME ns11_keycus_device::device_reset
             kc_p2 <= (others => '0');
             kc_p3 <= (others => '0');
+            kc_cap <= (others => '0'); kc_capdone <= '0'; kc_rpend <= '0';   -- DIAG
             mb_sel_d   <= '0';
             mb_hi_d    <= '0';
             mb_addr_d  <= (others => '0');
@@ -536,6 +622,13 @@ begin
                end if;
             end if;
 
+            -- DIAG (pocketrc C432): one cycle after the captured exchange read, latch what it returned.
+            if kc_rpend = '1' then
+               kc_cap(15 downto 0) <= data_read_r(15 downto 0);
+               kc_rpend   <= '0';
+               kc_capdone <= '1';
+            end if;
+
             if zn_system11 = '1' then
                -- ==== Namco System 11 memory map ====
                -- shared RAM @0x04000-0x0BFFF (mailbox, 16-bit words), bank reg
@@ -551,9 +644,45 @@ begin
                else
                   mb_sel_d <= '0';                                      -- KEYCUS/unmapped via data_read_r
                end if;
+               -- ==== System 11 GUN I/F @ synthetic 0x1F0000-0x1F000F (real 0x1F780000-0F) ====
+               -- MAME namcos11.cpp lightgun_r(): 16-bit offset n = byte 2n
+               --   0 -> GUN1X    2 -> GUN1Y    3 -> GUN1Y+1
+               --   4 -> GUN2X    6 -> GUN2Y    7 -> GUN2Y+1      (1 and 5 read back 0)
+               -- Fill BOTH halves of the addressed 32-bit word, exactly like the KEYCUS reads
+               -- below, so the CPU gets the right halfword whichever lane it extracts.
+               if read_en = '1' and unsigned(addr) >= 16#1F0000# and unsigned(addr) <= 16#1F000F# then
+                  data_read_r <= (others => '0');
+                  case addr(3 downto 2) is
+                     when "00" =>                                                    -- offsets 0,1
+                        data_read_r(15 downto  0) <= gun1_x;
+                     when "01" =>                                                    -- offsets 2,3
+                        data_read_r(15 downto  0) <= gun1_y;
+                        data_read_r(31 downto 16) <= std_logic_vector(unsigned(gun1_y) + 1);
+                     when "10" =>                                                    -- offsets 4,5
+                        data_read_r(15 downto  0) <= gun2_x;
+                     when others =>                                                  -- offsets 6,7
+                        data_read_r(15 downto  0) <= gun2_y;
+                        data_read_r(31 downto 16) <= std_logic_vector(unsigned(gun2_y) + 1);
+                  end case;
+               end if;
+               -- GUN I/F writes @ synthetic 0x1F8000 (real 0x1F788000) = LEDs + recoil solenoids.
+               -- Deliberately ignored: no physical solenoid/LED on a MiSTer, and MAME only drives
+               -- output lamps with them. Decoded so the write completes instead of falling through.
+
                -- ==== KEYCUS @0x20000-0x2001F ====
                if read_en = '1' and unsigned(addr) >= 16#20000# and unsigned(addr) <= 16#2001F# then
                   data_read_r <= (others => '0');
+                  -- DIAG (pocketrc C432): capture the FIRST exchange read (kc_p2=0xEFFF).
+                  --  latch guard+offset now; the returned value is latched 1 cycle later (kc_rpend).
+                  if keycus_id = x"07" and kc_p2 = x"EFFF" and kc_capdone = '0' and kc_rpend = '0' then
+                     if (kc_p1 = x"0000") and ((((kc_p3 = x"0000") or (kc_p3 = x"00DC")) and (kc_p2 = x"EFFF")) or (kc_p3 = x"2F15")) then
+                        kc_cap(23) <= '1';
+                     else
+                        kc_cap(23) <= '0';
+                     end if;
+                     kc_cap(18 downto 16) <= std_logic_vector(addr(4 downto 2));
+                     kc_rpend <= '1';
+                  end if;
                   -- MAME 16-bit offset n = byte 2n: word = addr(4:2) = n/2, lane = n&1
                   -- (even offset -> low lane [15:0], odd offset -> high lane [31:16]).
                   -- MAME logs and returns machine().rand() on an unexpected read; games never
